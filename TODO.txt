@@ -21,9 +21,26 @@ STATUS
                   5000/hr; fails loudly with guidance when the unauth limit is
                   hit. PRs with no description are recorded as a benign
                   content.bodyError. Verified on the 6 articles in outputs/dump.
-[TODO]            Manual, Release Note, Supplemental Document
-                  (stubbed in enrich_bodies.ts TYPE_ENRICHERS — HTML scrape via
-                  host->selector map).
+[DONE 2026-06-03] Manual / Release Note / Supplemental Document — implemented in
+                  enrich_bodies.ts (enrichDocPage, see sections 2-4). Host->selector
+                  map (HOST_RULES) + generic fallback; extracts ONLY the content
+                  container and strips in-page nav/sidebar/breadcrumb/prev-next/
+                  footer + Sphinx ¶ headerlinks, then serializes to markdown
+                  (headings, lists, code blocks, links/images resolved to
+                  absolute). Follows redirects and records the FINAL url as
+                  content.bodySource. Verified per host:
+                    clouddocs.f5.com  -> [role=main] / article.docs-container  OK
+                    techdocs.f5.com   -> div.pageContent                       OK
+                    docs.nginx.com    -> [data-testid=content]                 OK
+                    docs.cloud.f5.com -> JS-RENDERED (server HTML is only the
+                       nav menu; body injected client-side) -> flagged with
+                       content.bodyError, needs a headless browser (out of scope).
+                  Unmapped hosts fall back + are logged via console.warn.
+                  NOTE: Manual not yet run over the FULL corpus (3338 in the
+                  --days=7 dump); ~21% are docs.cloud.f5.com and will be flagged.
+
+[REMAINING]       docs.cloud.f5.com bodies (JS-rendered) — would need a headless
+                  browser (e.g. astral/puppeteer). Separate, larger effort.
 
 NOTE: output directories were consolidated under outputs/ (outputs/dump,
 outputs/output, outputs/last_week) and git-ignored. The dump is now at

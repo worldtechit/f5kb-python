@@ -212,50 +212,102 @@ function isHidden(el: Element): boolean {
   return /display:none/i.test(style);
 }
 
-// Serialize a node's subtree to compact markdown, preserving links and emphasis
-// but dropping tags/attributes that are pure presentation.
-function nodeToMarkdown(node: Node): string {
-  if (node.nodeType === TEXT_NODE) {
-    return (node.textContent ?? "").replace(/\s+/g, " ");
-  }
-  if (!isElement(node)) return "";
-  const el = node;
-  if (isHidden(el)) return "";
-  const tag = el.tagName.toLowerCase();
-  const inner = () =>
-    Array.from(el.childNodes).map(nodeToMarkdown).join("");
-  switch (tag) {
-    case "script":
-    case "style":
-      return "";
-    case "br":
-      return "\n";
-    case "a": {
-      const href = el.getAttribute("href") ?? "";
-      const text = inner().trim();
-      if (!text) return "";
-      return href ? `[${text}](${href})` : text;
-    }
-    case "b":
-    case "strong":
-      return `**${inner().trim()}**`;
-    case "i":
-    case "em":
-      return `*${inner().trim()}*`;
-    case "code":
-      return `\`${inner().trim()}\``;
-    case "li":
-      return `- ${inner().trim()}\n`;
-    case "ul":
-    case "ol":
-      return `${inner()}\n`;
-    case "p":
-    case "div":
-      return `${inner().trim()}\n\n`;
-    default:
-      return inner();
+// Resolve a possibly-relative URL against the page it came from.
+function resolveUrl(href: string, base?: string): string {
+  if (!base) return href;
+  try {
+    return new URL(href, base).href;
+  } catch {
+    return href;
   }
 }
+
+// Build a serializer that turns a node subtree into compact markdown, preserving
+// structure (headings, lists, code blocks, links, images) while dropping pure
+// presentation. `baseUrl` resolves relative links/images when given.
+function makeSerializer(baseUrl?: string): (node: Node) => string {
+  const serialize = (node: Node): string => {
+    if (node.nodeType === TEXT_NODE) {
+      return (node.textContent ?? "").replace(/\s+/g, " ");
+    }
+    if (!isElement(node)) return "";
+    const el = node;
+    if (isHidden(el)) return "";
+    const tag = el.tagName.toLowerCase();
+    const inner = () => Array.from(el.childNodes).map(serialize).join("");
+    switch (tag) {
+      case "script":
+      case "style":
+      case "noscript":
+        return "";
+      case "br":
+        return "\n";
+      case "hr":
+        return "\n---\n\n";
+      case "h1":
+      case "h2":
+      case "h3":
+      case "h4":
+      case "h5":
+      case "h6": {
+        const t = inner().replace(/\s+/g, " ").trim();
+        return t ? `\n${"#".repeat(+tag[1])} ${t}\n\n` : "";
+      }
+      case "a": {
+        const href = el.getAttribute("href") ?? "";
+        const text = inner().trim();
+        if (!text) return "";
+        return href ? `[${text}](${resolveUrl(href, baseUrl)})` : text;
+      }
+      case "img": {
+        const alt = (el.getAttribute("alt") ?? "").trim();
+        const src = el.getAttribute("src") ?? "";
+        return src ? `![${alt}](${resolveUrl(src, baseUrl)})` : "";
+      }
+      case "b":
+      case "strong":
+        return `**${inner().trim()}**`;
+      case "i":
+      case "em":
+        return `*${inner().trim()}*`;
+      case "code":
+        // Inline code only; <pre> handles block code below.
+        return `\`${inner().trim()}\``;
+      case "pre": {
+        const code = (el.textContent ?? "").replace(/\n+$/, "");
+        return code.trim() ? `\n\`\`\`\n${code}\n\`\`\`\n\n` : "";
+      }
+      case "blockquote":
+        return `> ${inner().trim().replace(/\n/g, "\n> ")}\n\n`;
+      case "li":
+        return `- ${inner().replace(/\s+/g, " ").trim()}\n`;
+      case "ul":
+      case "ol":
+        return `${inner()}\n`;
+      case "tr":
+        return `${
+          Array.from(el.children).map((c) => serialize(c).trim()).join(" | ")
+        }\n`;
+      case "th":
+      case "td":
+        return inner().replace(/\s+/g, " ").trim();
+      case "table":
+      case "thead":
+      case "tbody":
+        return `${inner()}\n`;
+      case "p":
+      case "div":
+      case "section":
+        return `${inner().trim()}\n\n`;
+      default:
+        return inner();
+    }
+  };
+  return serialize;
+}
+
+// Back-compat alias for the Bug Tracker extractor (links there are absolute).
+const nodeToMarkdown = makeSerializer();
 
 // ---------------------------------------------------------------------------
 // Bug Tracker enricher
@@ -391,13 +443,131 @@ const enrichGithub: Enricher = async (article, nowIso) => {
 };
 
 // ---------------------------------------------------------------------------
+// Doc-page enricher (Manual / Release Note / Supplemental Document)
+// ---------------------------------------------------------------------------
+// These types have no body in the search index; the body lives on the rendered
+// doc page each `link` points to. Different doc-site generators wrap the body in
+// a different container, so we map host -> content selector and extract ONLY
+// that container, stripping in-page nav/sidebar/footer. Site header/footer live
+// outside the container and the article title/dates are already in metadata.
+interface HostRule {
+  /** CSS selector(s) for the main content container, tried in order. */
+  selectors: string[];
+  /** True when the body is client-rendered (not in the fetched HTML). */
+  jsRendered?: boolean;
+}
+
+// Hosts observed across Manual/Release_Note/Supplemental_Document. Add new hosts
+// here as the corpus widens (run with logging to surface unmapped ones).
+const HOST_RULES: Record<string, HostRule> = {
+  "clouddocs.f5.com": { selectors: ["[role=main]", "article.docs-container"] },
+  "techdocs.f5.com": { selectors: ["div.pageContent", "div.manual-chapter", "main"] },
+  "docs.nginx.com": { selectors: ["[data-testid=content]", "main.content", "article"] },
+  // docs.cloud.f5.com server-renders only its nav menu; the article body is
+  // injected client-side, so a plain fetch can't see it (needs a headless
+  // browser — out of scope for this scraper).
+  "docs.cloud.f5.com": { selectors: [], jsRendered: true },
+};
+
+// Generic fallback for unmapped hosts.
+const GENERIC_SELECTORS = ["main", "article", "[role=main]", "#main-content", "div.content"];
+
+// Descendants to remove from the chosen container before serializing: in-page
+// navigation, sidebars, breadcrumbs, prev/next, edit/feedback widgets, etc.
+const STRIP_SELECTORS = [
+  "nav", "header", "footer", "aside", "script", "style", "noscript", "form",
+  ".next-prev-btn-row", ".document-navigation", ".doc-nav", ".site-breadcrumb-nav",
+  "[class*=breadcrumb]", "[class*=pagination]", "[class*=edit-on]", "[class*=feedback]",
+  "[aria-label*=breadcrumb]", "[aria-label*=pagination]", "button",
+  ".headerlink", "a.headerlink", // Sphinx ¶ heading permalinks (clouddocs)
+];
+
+// Fetch a page following redirects, returning the body and the final URL.
+async function fetchDoc(
+  url: string,
+  attempt = 0,
+): Promise<{ html: string; finalUrl: string }> {
+  const MAX_RETRIES = 5;
+  try {
+    const res = await fetch(url, {
+      headers: { "User-Agent": USER_AGENT, Accept: "text/html" },
+      redirect: "follow",
+    });
+    if (!res.ok) {
+      if ((res.status >= 500 || res.status === 429) && attempt < MAX_RETRIES) {
+        await res.body?.cancel();
+        await sleep(750 * 2 ** attempt);
+        return fetchDoc(url, attempt + 1);
+      }
+      await res.body?.cancel();
+      throw new Error(`HTTP ${res.status}`);
+    }
+    return { html: await res.text(), finalUrl: res.url || url };
+  } catch (e) {
+    const msg = (e as Error).message ?? "";
+    if (attempt < MAX_RETRIES && !/^HTTP \d/.test(msg)) {
+      await sleep(750 * 2 ** attempt);
+      return fetchDoc(url, attempt + 1);
+    }
+    throw e;
+  }
+}
+
+function selectContainer(doc: ReturnType<DOMParser["parseFromString"]>, rule: HostRule | undefined): Element | null {
+  const selectors = rule && rule.selectors.length ? rule.selectors : GENERIC_SELECTORS;
+  for (const sel of selectors) {
+    let el: Element | null = null;
+    try { el = doc?.querySelector(sel) ?? null; } catch { /* bad selector */ }
+    if (el && (el.textContent ?? "").trim().length > 0) return el;
+  }
+  return null;
+}
+
+function extractDocBody(html: string, finalUrl: string, rule: HostRule | undefined): string {
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  const container = selectContainer(doc, rule);
+  if (!container) throw new Error("content container not found");
+  // Remove in-page chrome from a clone-free container (deno-dom mutates in place,
+  // which is fine — we discard the doc after).
+  for (const sel of STRIP_SELECTORS) {
+    let nodes; try { nodes = container.querySelectorAll(sel); } catch { continue; }
+    for (const n of nodes as unknown as Element[]) n.remove();
+  }
+  const md = makeSerializer(finalUrl)(container);
+  return md.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+const enrichDocPage: Enricher = async (article, nowIso) => {
+  const url = article.link;
+  if (!url) throw new Error("no link to fetch");
+  const host = new URL(url).hostname;
+  const rule = HOST_RULES[host];
+  if (rule?.jsRendered) {
+    return {
+      bodySource: url,
+      fetchedAt: nowIso,
+      bodyError: `JS-rendered host ${host}: body not in fetched HTML (needs headless browser)`,
+    };
+  }
+  if (!rule) console.warn(`  [doc] unmapped host: ${host} (using generic fallback) — ${url}`);
+
+  const { html, finalUrl } = await fetchDoc(url);
+  const body_text = extractDocBody(html, finalUrl, rule);
+  if (body_text.length < 40) {
+    throw new Error(`extracted body too short (${body_text.length} chars)`);
+  }
+  return { body_text, bodySource: finalUrl, fetchedAt: nowIso };
+};
+
+// ---------------------------------------------------------------------------
 // Registry: type key (dump subdir name) -> enricher
 // ---------------------------------------------------------------------------
 const TYPE_ENRICHERS: Record<string, Enricher> = {
   Bug_Tracker: enrichBugTracker,
   F5_GitHub: enrichGithub,
-  // TODO (see TODO.txt): Manual, Release_Note, Supplemental_Document — HTML
-  // scrape via a host->selector map.
+  Manual: enrichDocPage,
+  Release_Note: enrichDocPage,
+  Supplemental_Document: enrichDocPage,
 };
 
 // ---------------------------------------------------------------------------

@@ -52,11 +52,17 @@ ENRICH_BODIES.TS (article bodies for empty-content types)
   if it already has body_text or a recorded bodyError (use --refetch to force).
   Flags: --concurrency=N (default 4), --delay-ms=N (default 200), --limit=N.
 
-  Implemented types: Bug_Tracker, F5_GitHub. For F5_GitHub, set GITHUB_TOKEN
-  (and pass --allow-env) to raise the GitHub API limit from 60 to 5,000 req/hr;
-  it also handles repo-root README and /blob/ raw-file links for the full corpus.
-  (Manual/Release_Note/Supplemental_Document via host->selector HTML scrape are
-  still TODO — see TODO.txt.)
+  Implemented types: Bug_Tracker, F5_GitHub, Manual, Release_Note,
+  Supplemental_Document.
+    - F5_GitHub: set GITHUB_TOKEN (and pass --allow-env) to raise the GitHub API
+      limit from 60 to 5,000 req/hr; handles /issues, /pull, repo-root README,
+      and /blob/ raw-file links.
+    - Manual/Release_Note/Supplemental_Document: doc-page scrape driven by the
+      HOST_RULES host->selector map (clouddocs.f5.com, techdocs.f5.com,
+      docs.nginx.com) with a generic fallback for unmapped hosts (logged).
+      Extracts ONLY the content container as markdown (headings/lists/code/links).
+      docs.cloud.f5.com is client-rendered (body not in the fetched HTML) and is
+      flagged with content.bodyError — it needs a headless browser (not done).
 
 REQUIREMENTS
 ------------
