@@ -1,0 +1,537 @@
+F5 Coveo Search API — Available Fields
+=======================================
+
+Fields returned by the Coveo search API when no fieldsToInclude restriction
+is applied. Based on samples from 12 document types across multiple date
+ranges (Support Solution, Release Note, Security Advisory, Known Issue,
+Manual, Bug Tracker, Knowledge, Policy, Operations Guide, Supplemental
+Document, Video, Education).
+
+Both fetch scripts request only a small subset (marked ***) to keep response
+sizes below Coveo's 20 MB per-response limit. To use additional fields, add
+the raw field name to the FIELDS_TO_INCLUDE array in the script.
+
+To request all fields, remove fieldsToInclude from the search body entirely —
+but keep page sizes small (~50 or less) to avoid the 20 MB limit.
+
+
+DOC TYPE SOURCE MAPPING
+-----------------------
+F5 uses three distinct backends behind Coveo. The backend determines which
+fields are present — especially the sf* group.
+
+  Salesforce Knowledge (SF Knowledge):
+    Support Solution, Known Issue, Knowledge, Security Advisory,
+    Operations Guide, Policy, Video
+    Fields: all sf* fields, f5_kb_id, f5_article_creator, f5_status,
+            f5_kb_public, sfdetails__c, sfapplies_to_*, sfdatacategory*, etc.
+
+  Non-Salesforce (file / custom connector):
+    Manual, Release Note, Supplemental Document, Bug Tracker
+    Fields: no sf* fields. May have filename, sitemapparenturl, f5_bug_*,
+            f5_isparentpage, f5_source_category, f5_language, etc.
+
+  Zendesk:
+    Education
+    Fields: zendesk* fields entirely replace the sf* group.
+            subject/syssubject replace title equivalents.
+
+
+TOP-LEVEL FIELDS
+----------------
+These sit directly on each result object (result.fieldName).
+All doc types return the same top-level shape.
+
+  Field                    Type     Notes
+  -----------------------  -------  ------------------------------------------------
+  title                    string   Full title including K-number prefix
+  clickUri                 string   *** Direct article URL (used as "link")
+  printableUri             string   Same as clickUri for these articles
+  uri                      string   Internal Salesforce URI (not the public URL)
+  excerpt                  string   *** Short extract (~150 chars) used as "summary"
+  firstSentences           null     Always null for these articles
+  summary                  null     Always null for these articles
+  uniqueId                 string   Coveo internal document identifier
+  primaryid                string   Coveo content hash identifier
+  score                    int      Relevance score (varies by query)
+  percentScore             float    Score as a percentage
+  rankingInfo              null     Populated only when debug ranking is requested
+  rating                   float    Always 0.0 (ratings not used)
+  flags                    string   e.g. "HasHtmlVersion;HasAllMetaDataStream"
+  hasHtmlVersion           bool     Always true for KB articles
+  hasMobileHtmlVersion     bool     Always false
+  isTopResult              bool     Promoted result flag
+  isRecommendation         bool     Recommended result flag
+  isUserActionView         bool     Analytics flag
+  titleHighlights          list     Highlight ranges for query terms (empty if no q)
+  excerptHighlights        list     Highlight ranges (empty if no q)
+  firstSentencesHighlights list     Always empty
+  printableUriHighlights   list     Always empty
+  summaryHighlights        list     Always empty
+  absentTerms              list     Query terms not found in this result
+  parentResult             null     Used for folded/grouped results
+  childResults             list     Child results when folding is active
+  totalNumberOfChildResults int     Count of child results
+
+Note: Coveo also returns capitalised duplicates of many fields (Title, ClickUri,
+Excerpt, etc.) — these are identical to the lowercase versions and can be ignored.
+
+
+RAW FIELDS  (result.raw.fieldName)
+-----------------------------------
+Fields marked *** are currently included via fieldsToInclude.
+Fields marked [sf]  are from Salesforce Knowledge records (SF Knowledge types only).
+Fields marked [sys] are Coveo system mirrors of another raw field (same value).
+Fields marked [bt]  are Bug Tracker specific.
+Fields marked [man] are Manual specific.
+Fields marked [rel] appear on Release Note and/or Supplemental Document.
+Fields marked [edu] are Education (Zendesk) specific.
+
+  Field                           Type    Notes
+  ------------------------------  ------  -----------------------------------------------
+
+  -- Article identity --
+  f5_kb_id                        string  KB article number, e.g. "K000161453"
+                                          SF Knowledge types only
+  sfarticlenumber                 string  [sf]  Same without the "K" prefix: "000161453"
+  sfkbid                          string  [sf]  Salesforce KnowledgeArticle ID (kA0Po...)
+  sfkavid                         string  [sf]  Salesforce KnowledgeArticleVersion ID (ka0Po...)
+  sfknowledgearticleid            string  [sf]  Same as sfkbid
+  sfid                            string  [sf]  Same as sfkavid
+  syssfid                         string  [sys] Mirror of sfid
+  sfurlname                       string  [sf]  URL slug, e.g. "K000161453"
+  permanentid                     string  Coveo content hash (stable across re-indexes)
+  primaryid                       string  Coveo primary content identifier
+  filename                        string  [bt][man][edu] Source filename for non-SF docs
+  sysfilename                     string  [sys] Mirror of filename
+
+  -- Title --
+  f5_title                        string  Title without the K-number prefix
+                                          SF Knowledge types only
+  sftitle                         string  [sf]  Same as f5_title
+  title                           string  [sys] Full title with K-number prefix
+  systitle                        string  [sys] Same as title
+  subject                         string  [edu] Article subject (Zendesk title field)
+  syssubject                      string  [sys] Mirror of subject
+
+  -- URLs --
+  clickableuri                    string  *** Public article URL (used as "link")
+  printableuri                    string  Same as clickableuri
+                                          Not present on Bug Tracker, Manual, Release Note,
+                                          Supplemental Document, Education
+  uri                             string  Same as clickableuri
+  sfpublic_facing_url__c          string  [sf]  Same as clickableuri
+  sysclickableuri                 string  [sys] Mirror of clickableuri
+  sysprintableuri                 string  [sys] Mirror of printableuri
+  sysuri                          string  [sys] Mirror of uri
+  urihash                         string  Hash of the URI
+  sysurihash                      string  [sys] Mirror of urihash
+  sitemapparenturl                string  [bt][man][rel] Parent URL from sitemap metadata
+  sitemaplastmodified             string  [rel] Last-modified date from sitemap entry
+
+  -- Dates (all Unix milliseconds unless noted) --
+  f5_original_published_date      int     *** Original publication date
+                                          SF Knowledge + Bug Tracker only; absent on
+                                          Manual, Release Note, Supplemental Document
+  f5_updated_published_date       int     *** Most recent publication/update date
+                                          SF Knowledge + Bug Tracker only; absent on
+                                          Manual, Release Note, Supplemental Document
+  f5_created_date                 int     Article creation date in Salesforce
+                                          SF Knowledge + Bug Tracker only
+  sffirstpublisheddate            int     *** [sf]  First published date (fallback)
+  sfdevc_firstpublisheddate__c    int     [sf]  Same as sffirstpublisheddate
+  sflastmodifieddate              int     *** [sf]  Last modified date (fallback)
+  sflastpublisheddate             int     [sf]  Last published date
+  date                            int     *** [sys] Coveo index date (= sysdate)
+  sysdate                         int     [sys] Same as date
+  indexeddate                     int     When Coveo last indexed this document (ms)
+  sysindexeddate                  int     [sys] Same as indexeddate
+
+  -- Content type & product --
+  f5_document_type                list    e.g. ["Support Solution"]
+  sfcontent_type__c               string  [sf]  Same value, as a plain string
+  f5_version                      list    Full version hierarchy, pipe-delimited.
+                                          e.g. ["BIG-IP", "BIG-IP APM|17|17.1", ...]
+                                          Not returned for Support Solution in all cases
+  f5_product                      list    Top-level product names only,
+                                          e.g. ["BIG-IP", "BIG-IP APM"]
+                                          Not returned for Support Solution in all cases
+  f5_product_grouping             list    Broad grouping, e.g. ["Uncategorized"]
+                                          SF Knowledge types only (excl. Support Solution)
+  f5_product_module               string  [bt][rel] Sub-module tag, e.g. "LTM", "APM"
+  f5_source_name                  string  Always "Service Knowledge" for KB articles
+  f5_source_category              string  [rel] Source category label for non-SF content
+  f5_language                     string  [rel] Language code for Release Notes /
+                                          Supplemental Documents (e.g. "en")
+                                          Distinct from sflanguage / language
+  sfrecord_type_name__c           string  [sf]  e.g. "Support Service"
+  sfrecordtypename                string  [sf]  Same as sfrecord_type_name__c
+  sfrecordtypedevelopername       string  [sf]  API name, e.g. "Support_Service"
+  sfrecordtypeid                  string  [sf]  Salesforce RecordType ID
+
+  -- Version hierarchy helpers --
+  Per-product version hierarchies are populated on articles tagged with that
+  product. Each comes in two forms:
+    f5_{slug}_version_hierarchy        list  Full numeric hierarchy
+    f5_{slug}_short_version_hierarchy  list  Abbreviated numeric hierarchy
+  Plus for some older products:
+    f5_{slug}_version_pad              list  Zero-padded version for sorting
+
+  Observed slugs and the doc types they appear on:
+
+    Slug                              Types seen on
+    --------------------------------  --------------------------------------------------
+    big_ip                            Bug Tracker, Knowledge, Known Issue, Operations
+                                      Guide, Policy, Security Advisory, Video
+    big_ip_aam                        Knowledge, Operations Guide, Policy, Video
+    big_ip_afm                        Knowledge, Operations Guide, Policy, Security
+                                      Advisory, Video
+    big_ip_analytics                  Knowledge, Operations Guide, Policy, Security
+                                      Advisory, Video
+    big_ip_apm                        Knowledge, Operations Guide, Policy, Security
+                                      Advisory, Video
+    big_ip_asm                        Knowledge, Operations Guide, Policy, Security
+                                      Advisory, Video
+    big_ip_dns                        Bug Tracker, Knowledge, Operations Guide, Policy,
+                                      Security Advisory, Video
+    big_ip_edge_gateway               Knowledge
+    big_ip_fps                        Operations Guide, Policy, Security Advisory, Video
+    big_ip_gtm                        Knowledge, Manual
+    big_ip_link_controller            Knowledge, Operations Guide, Policy, Security
+                                      Advisory, Video
+    big_ip_ltm                        Knowledge, Known Issue, Operations Guide, Policy,
+                                      Security Advisory
+    big_ip_next_spk                   Knowledge, Policy, Security Advisory
+    big_ip_pem                        Knowledge, Operations Guide, Policy, Security
+                                      Advisory, Video
+    big_ip_psm                        Knowledge
+    big_ip_webaccelerator             Knowledge
+    big_ip_wom                        Knowledge
+    big_iq_centralized_management     Knowledge, Policy, Security Advisory
+    arx                               Knowledge
+    enterprise_manager                Knowledge
+    f5os_a                            Knowledge, Policy, Security Advisory
+    f5os_c                            Knowledge, Policy, Security Advisory
+    firepass                          Knowledge
+    nginx_controller                  Knowledge            (short form not observed)
+    nginx_plus                        Knowledge, Policy, Security Advisory
+    nginx_service_mesh                Knowledge            (short form not observed)
+    nginx_unit                        Knowledge            (short form not observed)
+    traffix_sdc                       Policy, Security Advisory
+
+  Note: Bug Tracker also has f5_big_ip_version_pad and f5_big_ip_dns_version_pad
+  (zero-padded versions for sort ordering). Manual has f5_big_ip_gtm_version_pad.
+
+  -- Article body & summary --
+  sfdetails__c                    string  [sf]  Full article HTML body (can be large).
+                                          SF Knowledge types only.
+  sfapplies_to_products__c        string  [sf]  JSON-encoded array of affected products
+                                          with embedded version lists. SF Knowledge
+                                          types only. Fill rates by type:
+                                            Support Solution  94.8%
+                                            Known Issue      100.0%
+                                            Knowledge         99.4%
+                                            Security Advisory 100.0%
+                                            Operations Guide  100.0%
+                                            Policy            97.8%
+                                            Video             34.1%
+                                          Value is a JSON string — requires a second
+                                          JSON.parse(). Format:
+                                          [{"Product":"BIG-IP"},
+                                           {"Versions":["16.X.X",...],"Product":"BIG-IP APM"}]
+                                          Not returned unless in fieldsToInclude.
+  sfapplies_to_versions__c        string  [sf]  Comma-separated version list, e.g.:
+                                          "13.0.0, 13.0.1, 13.0.X, 13.1.0, ..."
+                                          SF Knowledge types only. Fill rates are
+                                          consistently lower than sfapplies_to_products__c
+                                          (Support Solution 77.9%, Video 31.6%).
+  concepts                        string  Coveo-extracted key concepts (semicolon-sep.)
+  sysconcepts                     string  [sys] Mirror of concepts
+  wordcount                       int     Word count of the indexed content
+  size                            int     Indexed document size in bytes
+  syssize                         int     [sys] Mirror of size
+
+  -- Status & visibility --
+  f5_status                       string  Publication status, e.g. "Online"
+                                          SF Knowledge types only
+  sfpublishstatus                 string  [sf]  Same as f5_status
+  f5_kb_public                    string  Visibility, e.g. "Public"
+                                          SF Knowledge types only
+  f5_archived                     string  e.g. "Archived documents excluded"
+  f5_is_new_kb_article            string  "true"/"false" string
+                                          SF Knowledge types only (excl. Education)
+  sfislatestversion               string  [sf]  "true"/"false" string
+  sfisvisibleinapp                string  [sf]  Salesforce channel visibility flags
+  sfisvisibleincsp                string  [sf]  (Customer Self-service Portal)
+  sfisvisibleinpkb                string  [sf]  (Public Knowledge Base)
+  sfisvisibleinprm                string  [sf]  (Partner Portal)
+  sfvalidationstatus              string  [sf]  e.g. "Validated"
+
+  -- Author / org --
+  f5_article_creator              string  Author display name
+                                          SF Knowledge types only
+  sfarticlecreatedbyname          string  [sf]  Same as f5_article_creator
+  f5_employee                     string  "true"/"false" — whether author is F5 employee
+                                          SF Knowledge types only
+  sff5_employee__c                string  [sf]  Same as f5_employee
+  sforganizationid                string  [sf]  Salesforce Org ID: 00D00000000hXqv
+  sflanguage                      string  [sf]  e.g. "en_US"
+  language                        list    Coveo language, e.g. ["English"]
+  syslanguage                     list    [sys] Mirror of language
+
+  -- Salesforce Data Categories (SF Knowledge types only) --
+  These are Salesforce Knowledge data category group values used for
+  article taxonomy. Observed groups and the types they appear on:
+
+  sfdatacategorybig_ip_group1         string  [sf]  BIG-IP primary category value
+                                              Knowledge, Policy, Support Solution
+  sfdatacategorybig_ip_group1expanded string  [sf]  Expanded form of above
+  sfdatacategorybig_ip_group2         string  [sf]  BIG-IP secondary category value
+                                              Knowledge, Policy
+  sfdatacategorybig_ip_group2expanded string  [sf]  Expanded form of above
+  sfdatacategorynginx                 string  [sf]  NGINX category value. Policy only
+  sfdatacategorynginxexpanded         string  [sf]  Expanded form of above
+  sfdatacategoryother_f5              string  [sf]  Other F5 products category
+                                              Knowledge, Policy
+  sfdatacategoryother_f5expanded      string  [sf]  Expanded form of above
+
+  -- Bug Tracker specific fields --
+  These fields only appear on Bug Tracker articles.
+
+  f5_bug_id                           string  [bt]  Bug ID number
+  f5_bug_severity                     string  [bt]  e.g. "3-Major"
+  f5_bug_state                        string  [bt]  e.g. "Closed", "Open"
+  f5_bug_product_known_affected_version string [bt] Affected version string
+  f5_fix_category                     string  [bt]  Fix classification
+  f5_related_kb_id                    string  [bt]  Related KB article number(s)
+  f5_alternate_bug_id                 string  [bt]  Alternate/legacy bug ID
+  f5_alternate_related_kb_id          string  [bt]  Alternate related KB ID
+  f5_agc                              string  [bt]  AGC (product area code) tag
+  f5_product_family                   string  [bt]  Product family grouping
+  f5_version_display_name             string  [bt]  Human-readable version label
+  f5_big_ip                           string  [bt]  BIG-IP version tag for bug
+  f5_big_ip_dns                       string  [bt]  BIG-IP DNS version tag for bug
+  f5_big_ip_version_pad               list    [bt]  Zero-padded BIG-IP version (sort)
+  f5_big_ip_dns_version_pad           list    [bt]  Zero-padded DNS version (sort)
+
+  -- Manual specific fields --
+  These fields only appear on Manual (documentation) articles.
+
+  f5_isparentpage                     string  [man] "true" if this is a parent/TOC page
+  f5_keywords                         string  [man] SEO/search keywords
+  f5_lifecycle                        string  [man] Documentation lifecycle status
+  f5_big_ip_gtm                       string  [man] BIG-IP GTM version tag
+  f5_big_ip_gtm_version_pad           list    [man] Zero-padded GTM version (sort)
+
+  -- Education / Zendesk fields --
+  Education articles are sourced from Zendesk (not Salesforce). The sf* fields
+  are entirely absent; these Zendesk-specific fields appear instead.
+
+  zendeskid                           int     [edu] Zendesk article ID
+  zendeskitemtype                     string  [edu] e.g. "article"
+  zendeskcategoryname                 string  [edu] Zendesk category name
+  zendesksectionname                  string  [edu] Zendesk section name
+  zendesksubject                      string  [edu] Article subject/title
+  zendeskdescription                  string  [edu] Article description/excerpt
+  zendesksubmittername                string  [edu] Author name
+  zendeskcreationdate                 int     [edu] Creation timestamp (ms)
+  zendeskupdatedate                   int     [edu] Last update timestamp (ms)
+  zendesklocale                       string  [edu] Locale, e.g. "en-us"
+  zendeskdraft                        string  [edu] "true"/"false" draft status
+  zendeskfoldingchild                 list    [edu] Zendesk folding child hashes
+  zendeskfoldingcollection            string  [edu] Zendesk folding collection hash
+
+  -- Coveo infrastructure --
+  source                          string  Coveo source connector name
+  syssource                       string  [sys] Mirror of source
+  sourcetype                      string  e.g. "Salesforce", "Zendesk", "SitemapCrawler"
+  syssourcetype                   string  [sys] Mirror of sourcetype
+  collection                      string  Always "default"
+  syscollection                   string  [sys] Mirror of collection
+  connectortype                   string  e.g. "Salesforce2", "Zendesk2"
+  sysconnectortype                string  [sys] Mirror of connectortype
+  documenttype                    string  e.g. "Knowledge", "SitemapItem"
+  sysdocumenttype                 string  [sys] Mirror of documenttype
+  objecttype                      string  "Knowledge" for SF Knowledge types
+  objecttypelabel                 string  "Knowledge" for SF Knowledge types
+  objecttypelabelplural           string  "Knowledge" for SF Knowledge types
+  filetype                        string  e.g. "SalesforceItem", "YouTubeVideo"
+  sysfiletype                     string  [sys] Mirror of filetype
+  orderingid                      int     Coveo result ordering identifier
+  rowid                           int     Coveo internal row ID
+  sysrowid                        int     [sys] Mirror of rowid
+  transactionid                   int     Coveo transaction ID for this index operation
+  systransactionid                int     [sys] Mirror of transactionid
+
+  -- Folding (result grouping) --
+  foldingparent                   string  Hash of the parent document in a fold group
+                                          Not present on Bug Tracker, Manual, Release Note,
+                                          Supplemental Document
+  foldingchild                    list    Hashes of child documents in this fold group
+                                          Not present on Bug Tracker, Manual, Release Note,
+                                          Supplemental Document
+  foldingcollection               string  Hash identifying the fold group
+                                          Not present on Bug Tracker, Manual, Release Note,
+                                          Supplemental Document
+
+  -- Hierarchy (parent chain) --
+  parents                         string  XML snippet describing parent records
+                                          SF Knowledge types + Education only
+  sysparents                      string  [sys] Mirror of parents
+
+
+FIELDS CURRENTLY USED BY THE SCRIPTS
+--------------------------------------
+These are the six raw fields requested via fieldsToInclude, plus the three
+top-level fields that are always returned regardless:
+
+  Top-level (always returned):
+    title       → article "name"
+    clickUri    → article "link"
+    excerpt     → article "summary"
+
+  Raw (via fieldsToInclude):
+    clickableuri              fallback for "link" if clickUri is absent
+    f5_original_published_date  → "publicationDate" (primary)
+    sffirstpublisheddate        → "publicationDate" (fallback)
+    f5_updated_published_date   → "modificationDate" (primary)
+    sflastmodifieddate          → "modificationDate" (fallback)
+    date                        → "modificationDate" (last-resort fallback)
+
+Note: f5_original_published_date and f5_updated_published_date are absent on
+Manual, Release Note, and Supplemental Document articles — for those types the
+fallback chain (sffirstpublisheddate → sflastmodifieddate → date) is always used.
+
+
+FACET API GAPS — f5_version / f5_document_type ENUMERATION
+------------------------------------------------------------
+The f5_version and f5_document_type fields are used for --list-products and
+--list-types respectively. The facet API has two separate limitations that
+cause valid filter values to be missing from these lists.
+
+GAP 1 — numberOfValues slot starvation (fixed in both scripts)
+
+  f5_version stores a pipe-delimited version hierarchy, so a single article
+  tagged with "BIG-IP LTM 16.1.0" contributes four facet values:
+    "BIG-IP LTM"
+    "BIG-IP LTM|16"
+    "BIG-IP LTM|16|16.1"
+    "BIG-IP LTM|16|16.1|16.1.0"
+
+  Requesting numberOfValues: 500 fills the 500 slots with the most-frequent
+  values; versioned hierarchy entries crowd out less-common top-level names:
+
+    numberOfValues  Total returned  Top-level names  moreAvailable
+    500             500             37               true
+    1000            1000            43               true
+    2000            2000            62               true
+    5000            2769            73               false
+
+  Fix: fetch_f5_articles_flex.ts requests numberOfValues: 5000. The API is
+  exhausted at 2,769 values, returning all 73 top-level product names.
+
+GAP 2 — Coveo admin exclusion (unfixable from the client side)
+
+  Even with numberOfValues: 5000 and moreValuesAvailable: false, certain
+  valid @f5_version values do not appear in the facet results at all.
+
+  Confirmed example: "BIG-IP Documentation"
+    - @f5_version=="BIG-IP Documentation" returns 1,654 articles
+    - Those articles carry f5_version: ["BIG-IP Documentation"] in their raw fields
+    - The value does not appear anywhere in the 2,769 facet results
+
+  This is a Coveo platform-level admin decision; the F5 Coveo administrator
+  has excluded specific values from facet indexing (likely for UI cleanliness).
+  There is no API call that can reveal which values are excluded.
+
+WORKAROUND — type-filtered facet for hidden products
+
+  Running a facet query with an @f5_document_type filter active scopes the
+  facet computation to only the matching documents. Products that own a large
+  share of that document type become prominent enough to surface even if they
+  are excluded from the global unfiltered facet.
+
+  Example — find all products that have Manual articles:
+
+    POST /rest/search/v2
+    {
+      "q": "",
+      "aq": "@f5_document_type==\"Manual\"",
+      "numberOfResults": 0,
+      "facets": [{ "field": "f5_version", "numberOfValues": 5000, "type": "specific" }]
+    }
+
+  "BIG-IP Documentation" appeared via this technique after
+  --product="BIG-IP" --type="Manual" returned only 2 results.
+
+  Use this diagnostic any time a product+type combination returns unexpectedly
+  few results: re-run with numberOfResults: 0 and a facets block (filtered by
+  that document type) to see what product tags those articles actually carry.
+
+AUTOMATED DISCOVERY — --discover-products flag
+
+  The type-filtered facet technique is now automated in fetch_f5_articles_flex.ts
+  via the --discover-products flag, and as a standalone script in discover_products.ts.
+
+  How it works:
+    1. Fetches all document types from the global f5_document_type facet.
+    2. Fetches the global f5_version facet (baseline 73 top-level products).
+    3. For each document type, re-runs the f5_version facet with an
+       @f5_document_type filter active, collecting any new top-level names.
+    4. For each newly discovered name, runs a count query to get total articles.
+    5. Writes supplemental_products.json with all discovered products.
+
+  Final counts (as of last run):
+
+    Source                  Products
+    ----------------------  --------
+    Global facet            73
+    Hidden (type-filtered)  247
+    Manually added           1
+    Total                   321
+
+  Note — known gap: "BIG-IP Documentation" is not caught by the automated
+  scan. It uses a TechComm/Sitemap source connector (not Salesforce), and
+  while it does appear in the Manual type-filtered facet results, the
+  discover script's top-level name extraction misses it due to how F5's
+  Coveo admin has configured that facet. It was added manually to
+  supplemental_products.json (source: "manual_query", count: 1,654).
+  Query directly with @f5_version=="BIG-IP Documentation".
+
+  Note — confirmed duplicate tags: Two product pairs have confirmed
+  duplicate tag names; every article matching one also carries the other:
+    "BIG-IP Next CNF"  ↔  "BIG_IP_NEXT(CNF)"   (1,288 articles each)
+    "APM Clients"      ↔  "APM-Clients"         (811 articles each)
+  Both names appear in supplemental_products.json (both are valid filter
+  values). Use the clean name (no underscores/hyphens) when filtering.
+
+  Hidden products by document type that first revealed them:
+
+    Document Type       New hidden products found
+    ----------------    ------------------------
+    Support Solution    134
+    Policy               44
+    Bug Tracker          21
+    Knowledge            14
+    Known Issue          12
+    Release Note         10
+    Manual                7
+    Operations Guide      4
+    Security Advisory     1
+    Community, F5 GitHub, Video, Education,
+    Supplemental Document, Compliance         0
+
+  Output format (one entry per product):
+    {
+      "product": "BIG-IP TMOS",
+      "count": 3570,
+      "source": "type_filtered_facet",
+      "hiddenFromGlobalFacet": true,
+      "discoveredViaTypes": ["Bug Tracker"]
+    }
+
+  Run:
+    deno run --allow-net --allow-write fetch_f5_articles_flex.ts --discover-products
+
+  Takes ~3-4 minutes (~250 API calls). Use supplemental_products.json as the
+  authoritative list of all valid --product values instead of --list-products.

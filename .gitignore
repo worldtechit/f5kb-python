@@ -1,0 +1,12 @@
+# Output / generated data directories (article dumps, exports) — large, regenerable
+outputs/
+dump/
+output/
+last_week/
+
+# Local Claude Code settings (machine-specific permissions)
+.claude/settings.local.json
+
+# Scratch / temp
+*.tmp
+/tmp/

@@ -1,0 +1,45 @@
+F5 Portal Sitemap Notes
+=======================
+
+Sitemap index:
+  https://my.f5.com/manage/s/sitemap.xml
+
+Lists four child sitemaps:
+
+  https://my.f5.com/manage/s/sitemap-topicarticle-1.xml      ~19,985 URLs
+  https://my.f5.com/manage/s/sitemap-topicarticle-2.xml      ~15,326 URLs
+  https://my.f5.com/manage/s/sitemap-topicarticle-weekly.xml     ~93 URLs
+  https://my.f5.com/manage/s/sitemap-view-1.xml                    5 URLs
+
+Total article URLs across all sitemaps: ~35,400
+
+Each entry contains only two fields:
+  <loc>      — full article URL, e.g. https://my.f5.com/manage/s/article/K000160969
+  <lastmod>  — ISO 8601 timestamp, e.g. 2026-05-26T22:36:27.000Z
+
+What is NOT in the sitemaps:
+  - Article title
+  - Content type (Support Solution, Release Note, etc.)
+  - Product (BIG-IP, NGINX, etc.)
+  - Summary or excerpt
+  - Publication date (separate from lastmod)
+
+LIMITATIONS
+-----------
+The sitemaps cover all article types and products with no way to filter.
+To get any metadata beyond the URL and lastmod date, you would need to make
+a separate HTTP request to each article page — impractical at 35,000+ articles.
+
+The Coveo search API is a much better choice for building an index because it
+returns title, summary, dates, product, and content type in a single paginated
+response with full filtering support.
+
+POSSIBLE USES FOR THE SITEMAPS
+-------------------------------
+- Quick check of whether a specific article URL exists and when it was last modified
+- Discovering article IDs outside the Coveo search index (sitemaps show ~35,400
+  articles vs ~11,324 BIG-IP Support Solutions in Coveo, so there are many articles
+  the search query doesn't surface depending on filters used)
+- Detecting new or recently modified articles by polling sitemap-topicarticle-weekly.xml
+  (only ~93 entries, likely the most recently updated articles)
+- Cross-referencing a known article ID list against what is publicly accessible
