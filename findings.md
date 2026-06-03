@@ -2,7 +2,10 @@
 
 Reference document for rebuilding or extending the article fetcher.
 The goal was to programmatically retrieve F5 KB article metadata (title, URL,
-summary, dates) for BIG-IP Support Solution articles without requiring login.
+summary, dates) for BIG-IP Support Solution articles without requiring login —
+since extended to all 15 document types and to full article bodies (recovered
+off-API for the types the search index leaves empty; see the body-recovery
+subsection at the end).
 
 ---
 
@@ -959,25 +962,45 @@ types is not possible via this API; only metadata + excerpt are captured. (The
 actual Manual/Release-Note body lives on the rendered TechComm HTML pages, not
 in the search index.)
 
-**Body recovery is feasible off-API (recon 2026-06-02) — see `TODO.txt`.** Each
-empty-body article's `link` resolves to a public HTTP-200 page:
-- **Bug Tracker** — deterministic static URL
-  `https://cdn.f5.com/product/bugtracker/ID<f5_bug_id>.html` (~16 KB, fully
-  structured: Symptoms/Conditions/Impact/Workaround/Fix; strip `<script>` noise).
-- **Manual** — multiple doc-site templates; 7-day-sample host split:
-  clouddocs.f5.com (1794), docs.cloud.f5.com (702), techdocs.f5.com (510),
-  docs.nginx.com (332). Known content selectors:
-  clouddocs `article.docs-container.site-article-inner`,
-  docs.nginx.com `main.content[data-testid=content]`; others TBD. Full corpus
-  (47k) likely has more hosts — enumerate first.
-- **Release Note / Supplemental Document** — docs.nginx.com in-sample (same
-  scraper path as Manual).
-- **F5 GitHub** — github.com repos/PRs/issues → use the GitHub REST API
-  (readme/pulls/issues endpoints); needs a token for the 60→5000 req/hr limit.
+**Body recovery — IMPLEMENTED off-API in `enrich_bodies.ts` (2026-06-03).** A
+separate resumable post-processor walks a dump directory, fetches each empty-body
+article's public page, extracts ONLY the body (no site chrome, nothing that just
+repeats the metadata), and writes `content.body_text` (+ `content.sections` where
+the source is labelled), `content.bodySource`, `content.fetchedAt`, or
+`content.bodyError` on failure. A `TYPE_ENRICHERS` registry maps each type to an
+enricher; resumability skips already-bodied/errored articles (`--refetch` /
+`--refetch-errors` override). HTTP retry/backoff mirrors `coveoPost`.
 
-The plan is to add a separate `enrich_bodies.ts` post-processor (host→selector
-config, resumable, polite throttling) that fills the `content` object from these
-pages. Full per-type plan, selectors, and risks live in `TODO.txt`.
+- **Bug Tracker** — deterministic static URL
+  `https://cdn.f5.com/product/bugtracker/ID<f5_bug_id>.html`. Extract ONLY
+  `<div class="bug-content">` (Symptoms/Impact/Conditions/Workaround/Fix
+  Information/Behavior Change/Guides) into `sections` + `body_text`; the header
+  block (Affected Products/Versions/Severity/Opened) duplicates metadata and is
+  excluded.
+- **F5 GitHub** — GitHub REST API (not HTML). URL dispatcher: `/issues/N`,
+  `/pull/N` → `body` markdown; repo root → README (base64-decoded); `/blob/ref/path`
+  → raw file. Reads `GITHUB_TOKEN` for the 60→5000 req/hr limit. PRs with no
+  description are recorded as a benign `bodyError`.
+- **Manual / Release Note / Supplemental Document** — doc-page scrape via a
+  `HOST_RULES` host→selector map + generic fallback (unmapped hosts logged).
+  Selectors verified: clouddocs.f5.com `[role=main]` (Sphinx; strip `.headerlink`
+  ¶ anchors), techdocs.f5.com `div.pageContent`, docs.nginx.com
+  `[data-testid=content]`. Strips in-page nav/sidebar/breadcrumb/prev-next/footer,
+  then serializes to markdown (headings/lists/code/links resolved to absolute);
+  follows redirects and records the final URL.
+- **docs.cloud.f5.com** (702 of the Manual sample) — Next.js app. Its rendered
+  DOM on API pages contains ONLY the nav menu, so it first *looked* like it needed
+  a headless browser — but the body is embedded in the page's
+  `<script id="__NEXT_DATA__">` JSON, recoverable by plain fetch + parse (NO
+  headless, not even for discovery). Two shapes:
+  `props.pageProps.docData.compiledSource` (prose) keeps the authored MDX as
+  interleaved `/* ... */` comment blocks → recovered and joined; `docData.swaggerFile`
+  (API specs) → rendered to markdown. Host rule flag `nextData: true`.
+
+**Coverage (full Manual run over the --days=7 dump, 2026-06-03): 3336/3338 (99.9%)**
+— clouddocs 1792/1794, techdocs 510/510, nginx 332/332, docs.cloud 702/702; the 2
+misses are genuinely-empty stub pages. All 15 document types now have bodies (9 from
+the index, 5 enriched off-API). See `readme.txt` for the `enrich_bodies.ts` usage.
 
 **Type-specific fields worth noting:** Bug Tracker carries `f5_bug_*`
 (severity/state/affected+fix version, CVE id); Security Advisory keeps CVE in

@@ -31,8 +31,9 @@ Five scripts are available:
                              each article's public page and extracts ONLY the body
                              (no site chrome, nothing that just repeats metadata),
                              writing content.sections + content.body_text back into
-                             the per-article JSON. Bug Tracker implemented; other
-                             empty-body types stubbed. See its own section below.
+                             the per-article JSON. Covers all 5 empty-body types
+                             (Bug Tracker, F5 GitHub, Manual, Release Note,
+                             Supplemental Document). See its own section below.
 
 Both fetch scripts handle all known Coveo API limits automatically (see NOTES below).
 
