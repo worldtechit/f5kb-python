@@ -28,7 +28,9 @@
  *       --days=30 --out=dump
  *
  * Options:
- *   --days=N         REQUIRED. Only dump articles modified in the last N days.
+ *   --days=N         Only dump articles modified in the last N days.
+ *   --all            Dump the entire corpus (no lower date bound). Use one of
+ *                    --days or --all.
  *   --out=DIR        REQUIRED. Output directory (created if missing).
  *   --config=FILE    Config YAML (default: dump_config.yaml).
  *   --fields-doc=F   Field-description reference (default: available_fields.txt).
@@ -118,6 +120,15 @@ async function fetchCoveoConfig(): Promise<CoveoConfig> {
   }
 
   return JSON.parse(data.actions[0].returnValue.returnValue) as CoveoConfig;
+}
+
+// Refresh an expired guest token in place (mutates the shared config object so
+// every subsequent coveoPost uses the new token).
+async function refreshConfig(config: CoveoConfig): Promise<void> {
+  const fresh = await fetchCoveoConfig();
+  config.accessToken = fresh.accessToken;
+  config.platformUrl = fresh.platformUrl;
+  config.organizationId = fresh.organizationId;
 }
 
 // ---------------------------------------------------------------------------
@@ -215,6 +226,14 @@ async function coveoPost(
     );
     if (!res.ok) {
       const text = await res.text();
+      // Expired/invalid guest token: refresh it in place and retry. The Coveo
+      // JWT is ~24h, but a long full-corpus dump can outlive it.
+      if ((res.status === 401 || res.status === 419) && attempt < MAX_RETRIES) {
+        console.warn(`  (token rejected ${res.status} — refreshing Coveo token)`);
+        await refreshConfig(config);
+        await new Promise((r) => setTimeout(r, 250));
+        return coveoPost(config, body, attempt + 1);
+      }
       // Retry transient server-side statuses; surface everything else (incl.
       // the 400 response-size error, which fetchPaged handles by shrinking).
       if ((res.status >= 500 || res.status === 429) && attempt < MAX_RETRIES) {
@@ -533,16 +552,21 @@ function usage(msg?: string): never {
   if (msg) console.error(`Error: ${msg}\n`);
   console.error(
     "Usage: deno run --allow-net --allow-read --allow-write dump_articles.ts \\\n" +
-      "         --days=N --out=DIR [--config=dump_config.yaml] [--types=\"A,B\"] \\\n" +
-      "         [--fields-doc=available_fields.txt] [--page-size=N] [--limit=N]",
+      "         (--days=N | --all) --out=DIR [--config=dump_config.yaml] [--types=\"A,B\"] \\\n" +
+      "         [--fields-doc=available_fields.txt] [--page-size=N] [--limit=N]\n\n" +
+      "  --days=N   Only dump articles modified in the last N days.\n" +
+      "  --all      Dump the entire corpus (no lower date bound). Use for a full dump.",
   );
   Deno.exit(msg ? 1 : 0);
 }
 
 if ("help" in args) usage();
 
+const allTime = "all" in args;
 const days = Number(args.days);
-if (!args.days || !Number.isFinite(days) || days <= 0) usage("--days must be a positive number");
+if (!allTime && (!args.days || !Number.isFinite(days) || days <= 0)) {
+  usage("provide --all or --days=N (a positive number)");
+}
 
 const outDir = args.out;
 if (!outDir) usage("--out (output directory) is required");
@@ -590,7 +614,8 @@ function normalize(c: TypeConfig): TypeConfig {
 // ---------------------------------------------------------------------------
 
 const nowMs = Date.now();
-const cutoffMs = nowMs - days * 86400000;
+// --all: no lower bound (F5 KB predates 2000, so this captures everything).
+const cutoffMs = allTime ? Date.UTC(2000, 0, 1) : nowMs - days * 86400000;
 const endMs = nowMs + 86400000; // slightly future so newest items are never clipped
 
 console.log("Fetching Coveo configuration from F5 portal...");
@@ -603,87 +628,129 @@ console.log(
     `(from ${fieldsDocPath})`,
 );
 console.log(
-  `Window: articles modified since ${new Date(cutoffMs).toISOString().slice(0, 10)} ` +
-    `(last ${days} day${days === 1 ? "" : "s"})\n`,
+  allTime
+    ? `Window: entire corpus (--all, no lower date bound)\n`
+    : `Window: articles modified since ${new Date(cutoffMs).toISOString().slice(0, 10)} ` +
+      `(last ${days} day${days === 1 ? "" : "s"})\n`,
 );
 
 await Deno.mkdir(outDir, { recursive: true });
 
-const manifest: Array<{ typeKey: string; documentType: string; count: number; dir: string }> = [];
+interface TypeStatus {
+  typeKey: string;
+  documentType: string;
+  dir: string;
+  status: "ok" | "partial" | "failed";
+  expected: number | null; // server count over the window
+  fetched: number; // results returned before write
+  written: number; // files successfully written
+  writeErrors: number;
+  error?: string;
+}
+
+const manifest: TypeStatus[] = [];
 
 for (const typeKey of typeKeys) {
   const cfg = normalize(typeConfigs[typeKey]);
+  const dir = sanitizeName(typeKey);
   if (!cfg.documentType) {
     console.warn(`Skipping "${typeKey}": no documentType in config`);
+    manifest.push({ typeKey, documentType: "", dir, status: "failed", expected: null, fetched: 0, written: 0, writeErrors: 0, error: "no documentType in config" });
     continue;
   }
 
   Deno.stdout.writeSync(new TextEncoder().encode(`${typeKey.padEnd(24)} ... `));
 
-  const results = await fetchTypeSince(
-    config,
-    cfg.documentType,
-    cutoffMs,
-    endMs,
-    pageSize,
-    limit,
-    () => {},
-  );
+  const st: TypeStatus = { typeKey, documentType: cfg.documentType, dir, status: "ok", expected: null, fetched: 0, written: 0, writeErrors: 0 };
+  try {
+    // Server-side count over the window — the target to validate against.
+    const windowAq = `@f5_document_type=="${cfg.documentType}" ${dateAq(cutoffMs, endMs)}`.trim();
+    st.expected = await getCount(config, windowAq);
 
-  const typeDir = `${outDir}/${sanitizeName(typeKey)}`;
-  await Deno.mkdir(typeDir, { recursive: true });
+    const results = await fetchTypeSince(config, cfg.documentType, cutoffMs, endMs, pageSize, limit, () => {});
+    st.fetched = results.length;
 
-  const catalogue = new Map<string, CatalogueEntry>();
-  const seenIds = new Map<string, number>();
+    const typeDir = `${outDir}/${dir}`;
+    await Deno.mkdir(typeDir, { recursive: true });
 
-  for (const r of results) {
-    const fields = flattenFieldsSafe(r);
-    updateCatalogue(catalogue, fields, descriptions);
+    const catalogue = new Map<string, CatalogueEntry>();
+    const seenIds = new Map<string, number>();
 
-    const { metadata, content } = splitEntry(fields, cfg);
-    const raw = (r.raw as CoveoResult) ?? {};
+    for (const r of results) {
+      const fields = flattenFieldsSafe(r);
+      updateCatalogue(catalogue, fields, descriptions);
 
-    // De-dupe filenames if two articles share an id.
-    let id = idOf(r);
-    const n = (seenIds.get(id) ?? 0) + 1;
-    seenIds.set(id, n);
-    if (n > 1) id = `${id}__${n}`;
+      const { metadata, content } = splitEntry(fields, cfg);
+      const raw = (r.raw as CoveoResult) ?? {};
 
-    const modMs = modMsOf(raw);
-    const entry = {
-      id,
-      documentType: cfg.documentType,
-      title: (r.title as string) ?? "",
-      link: (r.clickUri as string) ?? (raw.clickableuri as string) ?? "",
-      modifiedMs: modMs ?? null,
-      modified: modMs ? new Date(modMs).toISOString() : null,
-      capturedAt: new Date(nowMs).toISOString(),
-      metadata,
-      content,
-    };
-    await Deno.writeTextFile(`${typeDir}/${id}.json`, JSON.stringify(entry, null, 2));
+      // De-dupe filenames if two articles share an id.
+      let id = idOf(r);
+      const n = (seenIds.get(id) ?? 0) + 1;
+      seenIds.set(id, n);
+      if (n > 1) id = `${id}__${n}`;
+
+      const modMs = modMsOf(raw);
+      const entry = {
+        id,
+        documentType: cfg.documentType,
+        title: (r.title as string) ?? "",
+        link: (r.clickUri as string) ?? (raw.clickableuri as string) ?? "",
+        modifiedMs: modMs ?? null,
+        modified: modMs ? new Date(modMs).toISOString() : null,
+        capturedAt: new Date(nowMs).toISOString(),
+        metadata,
+        content,
+      };
+      // A single bad write must not abort the whole type.
+      try {
+        await Deno.writeTextFile(`${typeDir}/${id}.json`, JSON.stringify(entry, null, 2));
+        st.written++;
+      } catch (e) {
+        st.writeErrors++;
+        if (st.writeErrors <= 3) console.warn(`\n  write failed for ${id}: ${(e as Error).message}`);
+      }
+    }
+
+    await writeCatalogue(typeDir, typeKey, cfg.documentType, catalogue, results.length, cfg);
+
+    // Classify partial so the driver notices and can re-run the type. Undercount
+    // is only meaningful with --all: there the @date window covers the whole
+    // corpus, so written should equal the server count. With --days, `expected`
+    // is the @date (re-index) superset and the exact mod-date filter legitimately
+    // drops some, so written < expected is normal and not flagged.
+    const undercount = allTime && st.expected !== null && limit === Infinity && st.written < st.expected;
+    if (st.writeErrors > 0 || undercount) st.status = "partial";
+
+    const flag = st.status === "ok" ? "" : `  [${st.status.toUpperCase()}]`;
+    const exp = st.expected !== null ? `/${st.expected}` : "";
+    console.log(`${st.written}${exp} article${st.written === 1 ? "" : "s"} -> ${typeDir}/${flag}`);
+  } catch (e) {
+    st.status = "failed";
+    st.error = (e as Error).message;
+    console.log(`FAILED: ${st.error}`);
   }
-
-  await writeCatalogue(typeDir, typeKey, cfg.documentType, catalogue, results.length, cfg);
-
-  manifest.push({
-    typeKey,
-    documentType: cfg.documentType,
-    count: results.length,
-    dir: sanitizeName(typeKey),
-  });
-  console.log(`${results.length} article${results.length === 1 ? "" : "s"} -> ${typeDir}/`);
+  manifest.push(st);
 }
+
+const failed = manifest.filter((m) => m.status === "failed");
+const partial = manifest.filter((m) => m.status === "partial");
+const total = manifest.reduce((a, m) => a + m.written, 0);
 
 await Deno.writeTextFile(
   `${outDir}/_index.json`,
   JSON.stringify(
     {
-      days,
+      mode: allTime ? "all" : `days=${days}`,
       cutoff: new Date(cutoffMs).toISOString(),
       generatedAt: new Date(nowMs).toISOString(),
       config: configPath,
-      totalArticles: manifest.reduce((a, m) => a + m.count, 0),
+      totalArticles: total,
+      counts: {
+        types: manifest.length,
+        ok: manifest.filter((m) => m.status === "ok").length,
+        partial: partial.length,
+        failed: failed.length,
+      },
       types: manifest,
     },
     null,
@@ -691,11 +758,20 @@ await Deno.writeTextFile(
   ),
 );
 
-const total = manifest.reduce((a, m) => a + m.count, 0);
 console.log(
   `\nDone. ${total} article${total === 1 ? "" : "s"} across ${manifest.length} type(s) ` +
     `written to ${outDir}/ (manifest: ${outDir}/_index.json)`,
 );
+if (partial.length) {
+  console.warn(`\nPARTIAL (${partial.length}): ` +
+    partial.map((m) => `${m.typeKey} (${m.written}/${m.expected ?? "?"}, writeErr=${m.writeErrors})`).join(", "));
+}
+if (failed.length) {
+  console.error(`\nFAILED (${failed.length}): ` +
+    failed.map((m) => `${m.typeKey}: ${m.error}`).join("; "));
+  console.error(`Re-run just these with --types="${failed.map((m) => m.typeKey).join(",")}"`);
+  Deno.exit(1);
+}
 
 // flattenFields is defined above; this guarded wrapper keeps a bad result from
 // aborting the whole run.

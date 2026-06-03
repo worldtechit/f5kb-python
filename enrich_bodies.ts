@@ -695,7 +695,18 @@ async function runPool<T>(
   await Promise.all(runners);
 }
 
-async function enrichType(typeKey: string, args: Args) {
+interface TypeReport {
+  typeKey: string;
+  files: number;
+  enriched: number;
+  failed: number;
+  skipped: number;
+  missingDir?: boolean;
+  errors: Array<{ id: string; link: string; error: string }>;
+}
+
+async function enrichType(typeKey: string, args: Args): Promise<TypeReport> {
+  const report: TypeReport = { typeKey, files: 0, enriched: 0, failed: 0, skipped: 0, errors: [] };
   const enricher = TYPE_ENRICHERS[typeKey];
   const dir = `${args.dump}/${typeKey}`;
   let files: string[];
@@ -703,9 +714,11 @@ async function enrichType(typeKey: string, args: Args) {
     files = await listArticleFiles(dir);
   } catch {
     console.log(`  [${typeKey}] no directory ${dir} — skipping`);
-    return;
+    report.missingDir = true;
+    return report;
   }
   if (args.limit) files = files.slice(0, args.limit);
+  report.files = files.length;
 
   let done = 0, skipped = 0, ok = 0, failed = 0;
   const nowIso = new Date().toISOString();
@@ -726,12 +739,10 @@ async function enrichType(typeKey: string, args: Args) {
       result = await enricher(article, nowIso);
       ok++;
     } catch (e) {
-      result = {
-        bodySource: article.link ?? "",
-        fetchedAt: nowIso,
-        bodyError: (e as Error).message,
-      };
+      const error = (e as Error).message;
+      result = { bodySource: article.link ?? "", fetchedAt: nowIso, bodyError: error };
       failed++;
+      report.errors.push({ id: article.id ?? "", link: article.link ?? "", error });
     }
     // Clear any keys a prior run set so a re-enrich (e.g. after fixing a
     // JS-rendered host) doesn't leave a stale bodyError/body_text behind.
@@ -750,9 +761,13 @@ async function enrichType(typeKey: string, args: Args) {
     if (args.delayMs) await sleep(args.delayMs);
   });
 
+  report.enriched = ok;
+  report.failed = failed;
+  report.skipped = skipped;
   console.log(
     `  [${typeKey}] DONE: ${files.length} files — enriched=${ok} failed=${failed} skipped=${skipped}`,
   );
+  return report;
 }
 
 async function main() {
@@ -780,7 +795,27 @@ async function main() {
   if (toRun.includes("F5_GitHub")) {
     console.log(`GitHub auth: ${GITHUB_TOKEN ? "token present (5000/hr)" : "UNAUTHENTICATED (60/hr) — set GITHUB_TOKEN to raise"}`);
   }
-  for (const t of toRun) await enrichType(t, args);
+  const reports: TypeReport[] = [];
+  for (const t of toRun) reports.push(await enrichType(t, args));
+
+  // Write a machine-readable report so a long driven run can be inspected and
+  // re-run (re-process the failures with --refetch-errors).
+  const reportPath = `${args.dump}/_enrich_report.json`;
+  const totalFailed = reports.reduce((a, r) => a + r.failed, 0);
+  try {
+    await Deno.writeTextFile(
+      reportPath,
+      JSON.stringify({ generatedAt: new Date().toISOString(), types: reports }, null, 2) + "\n",
+    );
+    console.log(`\nReport: ${reportPath}`);
+  } catch (e) {
+    console.warn(`Could not write report: ${(e as Error).message}`);
+  }
+  if (totalFailed) {
+    console.warn(`\nFAILURES (${totalFailed}): ` +
+      reports.filter((r) => r.failed).map((r) => `${r.typeKey}=${r.failed}`).join(", ") +
+      ` — see ${reportPath}; re-run with --refetch-errors after fixing.`);
+  }
   console.log("All done.");
 }
 

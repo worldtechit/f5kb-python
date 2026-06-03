@@ -7,6 +7,11 @@ last_week/
 # Local Claude Code settings (machine-specific permissions)
 .claude/settings.local.json
 
+# Embedded tracking DB (lives under outputs/, but ignore anywhere)
+*.db
+*.db-journal
+*.db-wal
+
 # Scratch / temp
 *.tmp
 /tmp/

@@ -1,7 +1,7 @@
 F5 KB Article Index Fetcher
 ===========================
 
-Five scripts are available:
+Scripts (typical full-dump pipeline: dump_articles -> enrich_bodies -> track_articles):
 
   fetch_f5_articles.ts       Hardcoded to BIG-IP + Support Solution.
                              Simple, no configuration needed.
@@ -34,6 +34,14 @@ Five scripts are available:
                              the per-article JSON. Covers all 5 empty-body types
                              (Bug Tracker, F5 GitHub, Manual, Release Note,
                              Supplemental Document). See its own section below.
+
+  track_articles.ts          Maintains a master overview of every dumped article
+                             in an embedded SQLite DB (outputs/articles.db): one
+                             row per article with its several dates + a hash of
+                             the metadata and a hash of the content/body. On each
+                             run it classifies articles new/changed/unchanged/
+                             removed vs the prior run and logs every change. See
+                             its own section below.
 
 Both fetch scripts handle all known Coveo API limits automatically (see NOTES below).
 
@@ -70,7 +78,25 @@ ENRICH_BODIES.TS (article bodies for empty-content types)
 
   Re-running after mapping a new host: use --refetch-errors to re-process only
   the articles that previously recorded a content.bodyError (already-bodied
-  articles stay skipped).
+  articles stay skipped). Each run writes outputs/dump/_enrich_report.json
+  (per-type enriched/failed/skipped + the list of errored articles).
+
+TRACK_ARTICLES.TS (master overview / change tracking)
+-----------------------------------------------------
+    deno run --allow-read --allow-write track_articles.ts --dump=outputs/dump
+
+  Walks the dump and upserts one row per article into an embedded SQLite DB
+  (default outputs/articles.db) with: id, document_type, title, link; the dates
+  created_ms / original_published_ms / updated_published_ms / modified_ms /
+  captured_at; metadata_hash and content_hash (SHA-256 over canonicalized JSON,
+  with volatile keys bodySource/fetchedAt excluded from the content hash);
+  has_body; body_error; and first_seen_run / last_seen_run / last_changed_run.
+  Compares against the stored row and classifies each article new / changed /
+  unchanged, logging changes to a `changes` table and a per-run summary to a
+  `runs` table. Removed articles (rows in the scanned types absent from this
+  dump) are logged, not deleted.
+  Flags: --db=FILE, --types="A,B" (subset), --run-id=ID, --json.
+  Run it AFTER enrich_bodies.ts so bodies are included in the content hash.
 
 REQUIREMENTS
 ------------
@@ -258,7 +284,12 @@ QUICK START — dump_articles.ts (full per-article dump, config-driven)
 Dump every Support Solution modified in the last 7 days, one file per article:
 
     deno run --allow-net --allow-read --allow-write dump_articles.ts \
-        --days=7 --out=dump
+        --days=7 --out=outputs/dump --types=Support_Solution
+
+Dump the ENTIRE corpus for a type (no date window) with --all:
+
+    deno run --allow-net --allow-read --allow-write dump_articles.ts \
+        --all --out=outputs/dump --types=Support_Solution
 
 Output layout:
 
@@ -286,7 +317,10 @@ Each per-article file:
 
 OPTIONS (dump_articles.ts)
 --------------------------
-  --days=N         REQUIRED. Only dump articles modified in the last N days.
+  --days=N         Only dump articles modified in the last N days.
+  --all            Dump the entire corpus (no lower date bound). Provide one of
+                   --days or --all. With --all the script validates the written
+                   count against the server count per type and flags shortfalls.
   --out=DIR        REQUIRED. Output directory (created if missing).
   --config=FILE    Config YAML (default: dump_config.yaml).
   --fields-doc=F   Field-description reference used to annotate the catalogue
@@ -297,6 +331,12 @@ OPTIONS (dump_articles.ts)
                    automatically halves the page size for that request and
                    retries, so large content types degrade gracefully.
   --limit=N        Cap articles per type (default: no cap). For testing.
+
+  Resilience: the guest Coveo token is auto-refreshed if it expires mid-run
+  (401/419); each type is isolated so one type's failure does not abort the
+  others; _index.json records per-type status (ok/partial/failed) with the
+  written-vs-server counts, and the script exits non-zero if any type failed
+  (re-run just those with --types=...).
 
 CONFIGURING WHICH FIELDS ARE KEPT (dump_config.yaml)
 ----------------------------------------------------

@@ -1,17 +1,63 @@
 F5 ARTICLE DUMP — TODO
 ======================
 
-No open tasks.
+PLANNED: FULL-CORPUS DUMP (driven, soon)
+----------------------------------------
+Dump the ENTIRE corpus (not a --days window) for every document type EXCEPT
+'Community' and 'F5 GitHub'. Workflow per the hardened scripts:
 
-The body-enrichment effort that previously lived here is complete: all 5
-document types whose body is absent from the Coveo search index (Bug Tracker,
-F5 GitHub, Manual, Release Note, Supplemental Document) are now recovered
-off-API by enrich_bodies.ts. Full Manual coverage on the --days=7 dump was
-3336/3338 (99.9%); the only misses are genuinely-empty stub pages. No headless
-browser was required (docs.cloud.f5.com bodies come from the page's embedded
-__NEXT_DATA__ JSON).
+  1. Metadata dump (all types except Community + F5_GitHub):
+       deno run --allow-net --allow-read --allow-write dump_articles.ts \
+         --all --out=outputs/dump \
+         --types="Support_Solution,Known_Issue,Knowledge,Security_Advisory,\
+Operations_Guide,Policy,Video,Compliance,Education,Manual,Release_Note,\
+Supplemental_Document,Bug_Tracker"
+     Watch the per-type lines + _index.json: any type marked FAILED/partial,
+     re-run just those via --types=. dump_articles.ts validates written vs the
+     server count under --all and exits non-zero if any type fails.
 
-See readme.txt for usage of all scripts and findings.md ("Body recovery"
-subsection) for the technical details of how each type's body is extracted.
+  2. Body enrichment for the empty-index types present in that set
+     (Bug_Tracker, Manual, Release_Note, Supplemental_Document):
+       deno run --allow-net --allow-read --allow-write --allow-env \
+         enrich_bodies.ts --dump=outputs/dump \
+         --types="Bug_Tracker,Manual,Release_Note,Supplemental_Document"
+     Review outputs/dump/_enrich_report.json; re-run failures with
+     --refetch-errors after fixing. (F5_GitHub is excluded from this dump, so no
+     GITHUB_TOKEN is needed.)
+     NOTE scale: Bug Tracker (~22k) and Manual (~47k) are large — this is the
+     long part; concurrency=4 + 200ms throttle by default. Be patient/polite.
 
-(File intentionally kept as the place to record future work.)
+  3. Build the master tracking DB:
+       deno run --allow-read --allow-write track_articles.ts --dump=outputs/dump
+     Records per-article dates + metadata/content hashes; classifies
+     new/changed/unchanged/removed across runs into outputs/articles.db.
+
+  Driver (me) reacts to anything not dumping correctly and fixes it.
+
+
+FUTURE IDEA (NOT now): skip unchanged bodies to cut API/scrape calls
+--------------------------------------------------------------------
+Use the tracking DB to avoid re-pulling expensive bodies. On a later dump, if an
+article's dates and metadata_hash are unchanged from the previous run (i.e. the
+record didn't change), skip re-fetching/re-scraping its body in enrich_bodies.ts
+and carry the existing content forward. Requires:
+  - track_articles.ts already stores metadata_hash + the dates (done).
+  - enrich_bodies.ts would consult the DB per article and short-circuit when the
+    metadata_hash matches and a content_hash already exists.
+  - Decide cadence: run track BEFORE enrich (to know what changed), or have a
+    combined orchestration step.
+This was explicitly deferred — capture only, do not implement yet.
+
+
+COMPLETED
+---------
+Body enrichment for all 5 empty-index types (Bug Tracker, F5 GitHub, Manual,
+Release Note, Supplemental Document) — see findings.md "Body recovery" and
+readme.txt. No headless browser needed (docs.cloud.f5.com bodies come from the
+page's embedded __NEXT_DATA__ JSON).
+
+Script hardening (2026-06-03): dump_articles.ts gained --all (full corpus),
+guest-token refresh on 401/419, per-type error isolation, written-vs-server
+count validation, and a richer _index.json + non-zero exit on failures.
+enrich_bodies.ts gained --refetch-errors and writes _enrich_report.json.
+Added track_articles.ts (embedded SQLite master overview).
