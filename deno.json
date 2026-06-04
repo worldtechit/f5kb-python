@@ -1,0 +1,37 @@
+{
+  "name": "f5kb",
+  "version": "1.0.0",
+  "exports": "./f5kb.ts",
+  "imports": {
+    "@std/yaml": "jsr:@std/yaml@^1",
+    "@std/assert": "jsr:@std/assert@^1",
+    "@std/testing": "jsr:@std/testing@^1",
+    "@b-fuze/deno-dom": "jsr:@b-fuze/deno-dom@^0.1.56"
+  },
+  "tasks": {
+    "f5kb": "deno run --allow-net --allow-read --allow-write --allow-env f5kb.ts",
+    "dump": "deno run --allow-net --allow-read --allow-write f5kb.ts dump",
+    "enrich": "deno run --allow-net --allow-read --allow-write --allow-env f5kb.ts enrich",
+    "track": "deno run --allow-read --allow-write f5kb.ts track",
+    "status": "deno run --allow-read f5kb.ts status",
+    "discover": "deno run --allow-net --allow-read --allow-write f5kb.ts discover",
+    "check": "deno check f5kb.ts cmd/*.ts lib/**/*.ts",
+    "test": "deno test --allow-read",
+    "test:live": "F5_LIVE=1 deno test --allow-net --allow-read --allow-env",
+    "fmt": "deno fmt",
+    "lint": "deno lint"
+  },
+  "fmt": {
+    "lineWidth": 100,
+    "indentWidth": 2,
+    "semiColons": true,
+    "exclude": ["outputs/", "test/fixtures/"]
+  },
+  "lint": {
+    "rules": { "tags": ["recommended"] },
+    "exclude": ["outputs/", "test/fixtures/"]
+  },
+  "test": {
+    "include": ["test/"]
+  }
+}
