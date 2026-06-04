@@ -195,9 +195,12 @@ export async function computeStatus(
     let db: DatabaseSync | null = null;
     try {
       db = openReadOnly(dbPath);
-      totalArticles = (db.prepare("SELECT COUNT(*) AS c FROM articles").get() as any)?.c ?? null;
-      bodied =
-        (db.prepare("SELECT COUNT(*) AS c FROM articles WHERE has_body=1").get() as any)?.c ?? null;
+      totalArticles =
+        (db.prepare("SELECT COUNT(*) AS c FROM articles").get() as { c: number } | undefined)?.c ??
+          null;
+      bodied = (db.prepare("SELECT COUNT(*) AS c FROM articles WHERE has_body=1").get() as
+        | { c: number }
+        | undefined)?.c ?? null;
 
       const errRows = db.prepare(
         "SELECT body_error FROM articles WHERE body_error IS NOT NULL AND body_error != ''",
@@ -213,7 +216,16 @@ export async function computeStatus(
 
       const run = db.prepare(
         "SELECT * FROM runs ORDER BY ran_at DESC LIMIT 1",
-      ).get() as any;
+      ).get() as {
+        run_id: string;
+        ran_at?: string;
+        dump_dir?: string;
+        scanned?: number;
+        new?: number;
+        changed?: number;
+        unchanged?: number;
+        removed?: number;
+      } | undefined;
       if (run) {
         lastRun = {
           runId: run.run_id,
@@ -228,7 +240,7 @@ export async function computeStatus(
       }
       const cap = db.prepare(
         "SELECT MAX(captured_at) AS m FROM articles",
-      ).get() as any;
+      ).get() as { m: string } | undefined;
       newestCapturedAt = cap?.m ?? null;
     } catch (e) {
       notes.push(`could not read DB ${dbPath}: ${(e as Error).message}`);

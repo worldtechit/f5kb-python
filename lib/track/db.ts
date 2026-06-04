@@ -46,6 +46,7 @@ export function initDb(db: DatabaseSync) {
 }
 
 // What changed between the stored row and the new record.
+// deno-lint-ignore no-explicit-any -- sqlite row is dynamically shaped
 export function diffFields(prev: any, rec: Record_): string[] {
   const changed: string[] = [];
   if (prev.metadata_hash !== rec.metadata_hash) changed.push("metadata");
@@ -147,6 +148,7 @@ export async function trackDump(opts: TrackDumpOpts): Promise<Summary> {
       scanned++;
       perType[typeKey].scanned++;
 
+      // deno-lint-ignore no-explicit-any -- sqlite row is dynamically shaped
       const prev = sel.get(rec.document_type, rec.id) as any;
       let changeType: "new" | "changed" | "unchanged";
       let lastChanged: string;
@@ -197,7 +199,7 @@ export async function trackDump(opts: TrackDumpOpts): Promise<Summary> {
   const placeholders = typeKeys.map(() => "?").join(",");
   const removedRows = db.prepare(
     `SELECT document_type,id FROM articles WHERE document_type IN (${placeholders}) AND last_seen_run!=?`,
-  ).all(...typeKeys, RUN_ID) as any[];
+  ).all(...typeKeys, RUN_ID) as Array<{ document_type: string; id: string }>;
   for (const r of removedRows) {
     logChange.run(RUN_ID, r.document_type, r.id, "removed", "");
   }
