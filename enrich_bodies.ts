@@ -352,30 +352,86 @@ function bugTrackerUrl(a: Article): string {
 function parseBugContent(html: string): Record<string, string> {
   const doc = new DOMParser().parseFromString(html, "text/html");
   const container = doc?.querySelector("div.bug-content");
-  if (!container) throw new Error("bug-content container not found");
+  if (container) {
+    // Standard template: <h4> section + content (Symptoms/Impact/...).
+    const sections: Record<string, string> = {};
+    let current: string | null = null;
+    let buf = "";
+    const flush = () => {
+      if (current) {
+        const text = buf.replace(/\n{3,}/g, "\n\n").trim();
+        if (text) sections[current] = text;
+      }
+      buf = "";
+    };
+    for (const node of Array.from(container.childNodes)) {
+      if (isElement(node) && isHidden(node)) continue; // hidden Behavior Change etc.
+      if (isElement(node) && node.tagName.toLowerCase() === "h4") {
+        flush();
+        current = (node.textContent ?? "").trim();
+        continue;
+      }
+      buf += nodeToMarkdown(node);
+    }
+    flush();
+    return sections;
+  }
 
+  // Vulnerability/CVE template: no bug-content div; the body is labelled fields
+  // in <div class="middlecontent">. Keep only the ones that aren't already in
+  // the dump metadata (CVE list, Related Article, Vulnerability Severity); skip
+  // Affected Product(s)/Opened/Last Modified, which duplicate metadata.
+  const mid = doc?.querySelector("div.middlecontent");
+  if (!mid) throw new Error("bug-content container not found");
+  const fields = parseLabeledFields(mid);
   const sections: Record<string, string> = {};
-  let current: string | null = null;
+  for (const [label, value] of Object.entries(fields)) {
+    if (/CVE|Related Article|Vulnerability Severity/i.test(label) && value) {
+      sections[label] = value;
+    }
+  }
+  return sections;
+}
+
+// Parse "<span class=standard-field>Label:</span> value …" pairs from a subtree.
+// Each standard-field span starts a new field; following text/links (until the
+// next such span) are its value (links preserved as markdown).
+function parseLabeledFields(root: Element): Record<string, string> {
+  const fields: Record<string, string> = {};
+  let label: string | null = null;
   let buf = "";
   const flush = () => {
-    if (current) {
-      const text = buf.replace(/\n{3,}/g, "\n\n").trim();
-      if (text) sections[current] = text;
+    if (label) {
+      const v = buf.replace(/\s+/g, " ").trim();
+      if (v) fields[label] = v;
     }
     buf = "";
   };
-
-  for (const node of Array.from(container.childNodes)) {
-    if (isElement(node) && isHidden(node)) continue; // hidden Behavior Change etc.
-    if (isElement(node) && node.tagName.toLowerCase() === "h4") {
-      flush();
-      current = (node.textContent ?? "").trim();
-      continue;
+  const walk = (node: Node) => {
+    if (node.nodeType === TEXT_NODE) {
+      buf += node.textContent ?? "";
+      return;
     }
-    buf += nodeToMarkdown(node);
-  }
+    if (!isElement(node)) return;
+    const el = node;
+    if (isHidden(el)) return;
+    const cls = el.getAttribute("class") ?? "";
+    if (cls.includes("standard-field")) {
+      flush();
+      label = (el.textContent ?? "").replace(/:\s*$/, "").trim();
+      return; // label text consumed; its value follows
+    }
+    if (el.tagName.toLowerCase() === "a") {
+      const href = el.getAttribute("href") ?? "";
+      const text = (el.textContent ?? "").trim();
+      buf += href ? `[${text}](${href})` : text;
+      return;
+    }
+    for (const c of Array.from(el.childNodes)) walk(c);
+  };
+  walk(root);
   flush();
-  return sections;
+  return fields;
 }
 
 const enrichBugTracker: Enricher = (article, nowIso) => {
