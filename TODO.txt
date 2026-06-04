@@ -11,7 +11,7 @@ The seven standalone scripts and their three config files were consolidated into
 single `f5kb` CLI with subcommands plus a `lib/` module tree. Everything is now:
   - one entry point `f5kb.ts` + thin `cmd/*.ts` wrappers + `lib/` (see OUTLINE.txt);
   - one merged `config.yaml` (types: + field_descriptions: + products:);
-  - 101 offline tests (unit/integration/regression against test/fixtures/, network
+  - 102 offline tests (unit/integration/regression against test/fixtures/, network
     dependency-injected; opt-in live via F5_LIVE=1).
 Output formats and flag semantics are unchanged (verified: a before/after dump diff
 is byte-identical, and `f5kb track` over the 106k dump reported 0 new / 0 changed).

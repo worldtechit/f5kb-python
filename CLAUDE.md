@@ -108,7 +108,7 @@ going forward:
 - Subcommands are resumable and idempotent; never assume a clean restart is required.
 - **Network is dependency-injected.** `CoveoClient` (`lib/coveo/client.ts`) and
   `HttpClient` (`lib/http/fetcher.ts`) each take a `fetch` fn; tests pass a mock
-  (`test/_helpers/mock_fetch.ts`), which is why the 101-test suite runs offline.
+  (`test/_helpers/mock_fetch.ts`), which is why the 102-test suite runs offline.
   Don't reach for the global `fetch` directly in lib code.
 
 ## Git

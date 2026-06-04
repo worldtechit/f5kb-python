@@ -245,7 +245,7 @@ and are the only ones that touch the real API.
 7. TESTING APPROACH
 -------------------
 
-101 tests, all offline by default, under test/ in three categories:
+102 tests, all offline by default, under test/ in three categories:
 
   - unit (16 files) — one module's functions in isolation (paging, client,
     aura/config, dates, fields, the HTML parsers, hashing, args, logger, status,
