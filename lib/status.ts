@@ -286,8 +286,11 @@ export async function computeStatus(
   const newest = stamps.length ? Math.max(...stamps) : null;
   const stalenessMs = newest != null ? now - newest : null;
 
+  // Health reflects DUMP completeness: a type marked partial/failed in _index.json,
+  // or fetched fewer than the server reported. Per-article bodyErrors (404s, moved
+  // pages, empty stubs) are an expected enrichment-coverage detail shown in the ERR
+  // column + error-class breakdown — they do NOT degrade health on their own.
   const anyPartial = perType.some((t) => t.status && t.status !== "ok") ||
-    perType.some((t) => (t.errors ?? 0) > 0) ||
     perType.some((t) => t.expected != null && t.written != null && t.written < t.expected);
   let health: StatusReport["overall"]["health"];
   if (stalenessMs != null && stalenessMs > STALE_MS) health = "STALE";

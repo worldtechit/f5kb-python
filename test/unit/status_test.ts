@@ -6,7 +6,8 @@
 // NETWORK: none (mocked)
 // ASSERTS:
 //   - computeStatus reads DB article/bodied counts + last run + per-type disk/index
-//   - health is OK for a fresh, complete dump; PARTIAL when a type reports errors
+//   - health is OK for a complete dump (bodyErrors don't degrade it); PARTIAL when a
+//     type is partial/failed or fetched fewer than the server count
 //   - error classes are tallied from body_error via classifyError
 //   - renderStatus returns a non-empty multi-line string
 // ===========================================================================
@@ -17,7 +18,7 @@ import { classifyError, computeStatus, renderStatus } from "../../lib/status.ts"
 import { initDb } from "../../lib/track/db.ts";
 
 // Build a temp dump dir with one type dir, an _index.json, and a seeded DB.
-async function seed(opts: { withError?: boolean } = {}) {
+async function seed(opts: { withError?: boolean; partial?: boolean } = {}) {
   const root = await Deno.makeTempDir();
   const dump = `${root}/dump`;
   await Deno.mkdir(`${dump}/Knowledge`, { recursive: true });
@@ -30,7 +31,11 @@ async function seed(opts: { withError?: boolean } = {}) {
   await Deno.writeTextFile(
     `${dump}/_index.json`,
     JSON.stringify({
-      types: [{ typeKey: "Knowledge", status: "ok", expected: 2, written: 2 }],
+      types: [
+        opts.partial
+          ? { typeKey: "Knowledge", status: "partial", expected: 5, written: 2 }
+          : { typeKey: "Knowledge", status: "ok", expected: 2, written: 2 },
+      ],
     }),
   );
   if (opts.withError) {
@@ -121,15 +126,28 @@ Deno.test("computeStatus: healthy complete dump -> OK with correct counts", asyn
   }
 });
 
-Deno.test("computeStatus: enrich failure -> PARTIAL + error class tally", async () => {
+Deno.test("computeStatus: per-article bodyErrors are tallied but keep health OK", async () => {
+  // bodyErrors (404s, moved pages, empty stubs) are an expected enrichment-coverage
+  // detail — they populate the ERR column + error-class breakdown but do NOT degrade
+  // health, because the DUMP itself is complete.
   const { root, dump, dbPath } = await seed({ withError: true });
   try {
     const rep = await computeStatus({ dump, db: dbPath });
-    assertEquals(rep.overall.health, "PARTIAL");
+    assertEquals(rep.overall.health, "OK");
     assertEquals(rep.errorClasses.find((e) => e.klass === "not-found")?.count, 1);
     const kn = rep.perType.find((t) => t.typeKey === "Knowledge")!;
-    assertEquals(kn.errors, 1);
+    assertEquals(kn.errors, 1); // from the DB grouping
     assertEquals(kn.bodied, 1);
+  } finally {
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test("computeStatus: an incomplete dump (written<expected) -> PARTIAL", async () => {
+  const { root, dump, dbPath } = await seed({ partial: true });
+  try {
+    const rep = await computeStatus({ dump, db: dbPath });
+    assertEquals(rep.overall.health, "PARTIAL");
   } finally {
     await Deno.remove(root, { recursive: true });
   }
