@@ -615,7 +615,16 @@ function selectContainer(doc: ReturnType<DOMParser["parseFromString"]>, rule: Ho
 
 function extractDocBody(html: string, finalUrl: string, rule: HostRule | undefined): string {
   const doc = new DOMParser().parseFromString(html, "text/html");
-  const container = selectContainer(doc, rule);
+  let container = selectContainer(doc, rule);
+  if (!container) {
+    // Last resort for plain/odd pages with no standard container (e.g. nginx.org
+    // changelog text files and directory listings): a substantial <pre>, else the
+    // whole <body>. STRIP_SELECTORS below removes any nav/header/footer chrome.
+    const pre = doc?.querySelector("pre");
+    container = (pre && (pre.textContent ?? "").trim().length > 200)
+      ? pre
+      : (doc?.querySelector("body") ?? null);
+  }
   if (!container) throw new Error("content container not found");
   // Remove in-page chrome from a clone-free container (deno-dom mutates in place,
   // which is fine — we discard the doc after).
@@ -702,6 +711,19 @@ const enrichDocPage: Enricher = async (article, nowIso) => {
   if (!rule) console.warn(`  [doc] unmapped host: ${host} (using generic fallback) — ${url}`);
 
   const { html, finalUrl } = await fetchDoc(url);
+  // Some doc URLs (notably docs.nginx.com pages being migrated) now redirect into
+  // the F5 KB. Those articles are Salesforce-Knowledge records whose body we
+  // already capture under their own type (Support_Solution/Knowledge/...). Record
+  // a cross-reference rather than scraping the JS-heavy my.f5.com SPA.
+  const finalHost = new URL(finalUrl).hostname;
+  if (finalHost === "my.f5.com" && host !== "my.f5.com") {
+    const km = finalUrl.match(/\/article\/(K\d+)/);
+    return {
+      bodySource: finalUrl,
+      fetchedAt: nowIso,
+      bodyError: `redirected into F5 KB ${km?.[1] ?? finalUrl}; body captured under its Salesforce type`,
+    };
+  }
   let body_text = "";
   if (rule?.nextData) {
     body_text = extractNextDataBody(html);
