@@ -206,12 +206,20 @@ async function loadFieldDescriptions(path: string): Promise<Record<string, strin
 // Coveo API calls
 // ---------------------------------------------------------------------------
 
+// Per-request wall-clock timeout. fetch() has no default timeout, so a socket
+// that goes dead (e.g. the machine sleeps / loses connectivity mid-request)
+// would otherwise hang forever. Aborting turns it into a rejection that the
+// retry/backoff below handles.
+const REQUEST_TIMEOUT_MS = 60_000;
+
 async function coveoPost(
   config: CoveoConfig,
   body: Record<string, unknown>,
   attempt = 0,
 ): Promise<Record<string, unknown>> {
   const MAX_RETRIES = 5;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(new Error("request timeout")), REQUEST_TIMEOUT_MS);
   try {
     const res = await fetch(
       `${config.platformUrl}/rest/search/v2?organizationId=${config.organizationId}`,
@@ -222,6 +230,7 @@ async function coveoPost(
           "Content-Type": "application/json",
         },
         body: JSON.stringify(body),
+        signal: ctrl.signal,
       },
     );
     if (!res.ok) {
@@ -252,6 +261,8 @@ async function coveoPost(
       return coveoPost(config, body, attempt + 1);
     }
     throw e;
+  } finally {
+    clearTimeout(timer);
   }
 }
 

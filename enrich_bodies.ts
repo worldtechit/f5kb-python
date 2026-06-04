@@ -135,7 +135,7 @@ type Enricher = (article: Article, nowIso: string) => Promise<EnrichResult>;
 async function fetchText(url: string, attempt = 0): Promise<string> {
   const MAX_RETRIES = 5;
   try {
-    const res = await fetch(url, {
+    const res = await fetchWithTimeout(url, {
       headers: { "User-Agent": USER_AGENT, Accept: "text/html" },
     });
     if (!res.ok) {
@@ -162,6 +162,20 @@ async function fetchText(url: string, attempt = 0): Promise<string> {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+// Per-request wall-clock timeout. fetch() has no default timeout, so a socket
+// that goes dead (machine sleeps / connectivity drops mid-request) would hang
+// forever; aborting turns it into a rejection the retry logic handles.
+const REQUEST_TIMEOUT_MS = 60_000;
+async function fetchWithTimeout(url: string, init: RequestInit = {}): Promise<Response> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(new Error("request timeout")), REQUEST_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...init, signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // GitHub token (optional) — set in main() from env. Raises the API limit from
 // 60 to 5,000 req/hr.
 let GITHUB_TOKEN: string | undefined;
@@ -182,7 +196,7 @@ async function githubApi(
   attempt = 0,
 ): Promise<Record<string, unknown>> {
   const MAX_RETRIES = 5;
-  const res = await fetch(`https://api.github.com${path}`, {
+  const res = await fetchWithTimeout(`https://api.github.com${path}`, {
     headers: githubHeaders(true),
   });
   if (res.ok) return await res.json();
@@ -505,7 +519,7 @@ async function fetchDoc(
 ): Promise<{ html: string; finalUrl: string }> {
   const MAX_RETRIES = 5;
   try {
-    const res = await fetch(url, {
+    const res = await fetchWithTimeout(url, {
       headers: { "User-Agent": USER_AGENT, Accept: "text/html" },
       redirect: "follow",
     });
