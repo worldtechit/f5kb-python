@@ -438,8 +438,16 @@ and the tracking DB is reindexed to match.
 
 Safety default: an edit flagged risky (body-dropped or body-error — the new version would
 lose or fail to capture a body the live file has) is HELD BACK and reported; pass
-`--include-risky` to apply those too. Risk is recomputed fresh from the actual files at
-approve time, so it reflects reality after any enrich pass.
+`--include-risky` to apply those too. Both the risk flags AND the changed parts
+(metadata / content) are recomputed fresh from the actual files at approve time, so they
+reflect reality after any enrich pass. Each promoted edit is logged to the changelog with
+`changed` = the parts that differ (`["metadata"]`, `["content"]`, or both) and a `detail`
+label like `metadata-only` / `metadata+content`; `--list` shows the same in parentheses,
+e.g. `Manual/K123  (metadata+content)`.
+
+The changelog is ON by default for approve (this is the moment edits actually become live,
+so it belongs in the history) — it writes to `<dump>/_changelog.jsonl`. Use `--no-changelog`
+to disable or `--changelog=FILE` to redirect.
 
 Flags:
 
@@ -448,13 +456,14 @@ Flags:
 - `--types="A,B"` — Only act on these type dirs.
 - `--exclude-types="A,B"` — Exclude these type dirs (applied after `--types`).
 - `--ids="K1,K2"` — Only act on these article ids.
-- `--list` — Preview: show each pending edit + its risk flags, change nothing.
+- `--list` — Preview: show each pending edit + its change kind + risk flags, change nothing.
 - `--reject` — Discard the staged files instead of promoting them (the live data is left
   as-is).
 - `--include-risky` — Also promote edits flagged risky (default: hold them back).
 - `--no-archive` — Don't keep a `_replaced/` copy of overwritten files.
-- `--changelog[=FILE]` — Record promotions (op="edited", source="approve") to a JSONL
-  changelog. See **Changelog format**.
+- `--changelog[=FILE]` — Changelog path (default `<dump>/_changelog.jsonl`). ON by default
+  for approve. Records op="edited", source="approve". See **Changelog format**.
+- `--no-changelog` — Disable the changelog.
 - `--json` — Print the result as JSON on STDOUT.
 
 Example — review what is staged, then apply the safe ones:
@@ -495,7 +504,7 @@ Each line has these keys (required first, then optional):
 | `documentType` | string | the article's document type (e.g. "Bug Tracker")                    |
 | `id`           | string | the article id (matches the per-article filename)                   |
 | `title`        | string | (optional) article title                                            |
-| `changed`      | array  | (optional) field names that changed, for `op="edited"`              |
+| `changed`      | array  | (optional) which parts changed, for `op="edited"`: `["metadata"]`, `["content"]`, or both (approve computes this from the live vs new files) |
 | `hashOld`      | string | (optional) prior metadata_hash (absent ⇒ newly added)               |
 | `hashNew`      | string | (optional) new metadata_hash                                        |
 | `source`       | string | (optional) dump \| enrich \| track \| reconcile \| sync \| approve  |
@@ -515,6 +524,7 @@ lines:
 
 ```json
 {"runId":"2026-06-04T00:00:00.000Z","ts":"2026-06-04T00:00:01.2Z","op":"added","documentType":"Policy","id":"K12345","source":"dump"}
+{"runId":"2026-06-04T16:13:32.685Z","ts":"2026-06-04T16:13:40.1Z","op":"edited","documentType":"Manual","id":"K321","changed":["metadata","content"],"source":"approve","detail":"metadata+content; replaced file archived"}
 {"runId":"2026-06-04T00:00:00.000Z","ts":"2026-06-04T00:00:09.8Z","op":"deleted","documentType":"Manual","id":"K98","source":"reconcile","detail":"archived to _deleted/Manual/"}
 ```
 

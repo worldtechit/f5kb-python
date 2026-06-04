@@ -61,7 +61,7 @@ const COMMANDS: Record<string, CmdDef> = {
   approve: {
     desc: "Review + apply (or reject) overwrites staged in _pending/ by the gate.",
     flags:
-      "[--dump=outputs/dump] [--db=FILE] [--types=A,B] [--exclude-types=A,B] [--ids=K1,K2] [--list] [--reject] [--include-risky] [--no-archive] [--changelog[=FILE]] [--json]",
+      "[--dump=outputs/dump] [--db=FILE] [--types=A,B] [--exclude-types=A,B] [--ids=K1,K2] [--list] [--reject] [--include-risky] [--no-archive] [--changelog[=FILE]] [--no-changelog] [--json]",
     load: () => import("./cmd/approve.ts"),
   },
   status: {

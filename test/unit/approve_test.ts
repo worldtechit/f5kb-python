@@ -199,3 +199,55 @@ Deno.test("approve: --exclude-types skips that type's staged edits", async () =>
     await Deno.remove(out, { recursive: true });
   }
 });
+
+Deno.test("approve: changelog records metadata/content via `changed` + detail", async () => {
+  const out = await Deno.makeTempDir();
+  const clPath = `${out}/_changelog.jsonl`;
+  try {
+    // live vs pending differ in BOTH metadata and content (body).
+    const lp = livePath(out, "Manual", "K1");
+    await Deno.mkdir(lp.slice(0, lp.lastIndexOf("/")), { recursive: true });
+    await Deno.writeTextFile(
+      lp,
+      JSON.stringify({
+        id: "K1",
+        documentType: "Manual",
+        metadata: { v: 1 },
+        content: { body_text: "old" },
+      }),
+    );
+    const pp = pendingPath(out, "Manual", "K1");
+    await Deno.mkdir(pp.slice(0, pp.lastIndexOf("/")), { recursive: true });
+    await Deno.writeTextFile(
+      pp,
+      JSON.stringify({
+        id: "K1",
+        documentType: "Manual",
+        metadata: { v: 2 },
+        content: { body_text: "a much longer new body" },
+      }),
+    );
+    await mergePending(out, [{
+      typeKey: "Manual",
+      id: "K1",
+      op: "edited",
+      source: "sync",
+      stagedAt: "t",
+    }], "r");
+
+    const cl = new Changelog(clPath, "2026-06-04T00:00:00.000Z");
+    const res = await approve({ dump: out, nowMs: NOW, changelog: cl });
+    await cl.flush();
+
+    assertEquals(res.promoted, 1);
+    assertEquals(res.items[0].changed, ["metadata", "content"]);
+
+    const rec = JSON.parse((await Deno.readTextFile(clPath)).trim());
+    assertEquals(rec.op, "edited");
+    assertEquals(rec.source, "approve");
+    assertEquals(rec.changed, ["metadata", "content"]);
+    assertEquals(rec.detail.includes("metadata+content"), true);
+  } finally {
+    await Deno.remove(out, { recursive: true });
+  }
+});

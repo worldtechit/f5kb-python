@@ -17,7 +17,9 @@ import type { Article } from "./track/hashing.ts";
 import type { Changelog } from "./changelog.ts";
 import {
   archiveReplaced,
+  changeKind,
   computeRisk,
+  diffParts,
   livePath,
   loadPendingManifest,
   nowStamp,
@@ -52,6 +54,8 @@ export interface ApproveItem {
   id: string;
   title?: string;
   risk: string[];
+  /** which parts the edit touches: ["metadata"], ["content"], or both. */
+  changed: string[];
   action: "promoted" | "rejected" | "held-risky" | "missing-pending" | "preview";
   archived?: string | null;
 }
@@ -94,26 +98,38 @@ export async function approve(opts: ApproveOpts): Promise<ApproveResult> {
         id: e.id,
         title: e.title,
         risk: [],
+        changed: [],
         action: "missing-pending",
       });
       continue;
     }
 
-    // Recompute risk fresh from the actual files so it reflects reality (e.g. after
-    // an enrich pass filled the staged article's body).
+    // Recompute risk + the changed parts (metadata / content) fresh from the actual
+    // files so they reflect reality — e.g. after an enrich pass filled the staged
+    // article's body, content may differ even though only metadata first triggered it.
     let risk: string[] = [];
+    let changed: string[] = e.changed ?? [];
     let docType = e.typeKey;
     try {
       const pend = await readJson<Article>(pp);
       docType = pend.documentType ?? e.typeKey;
       const live = (await exists(lp)) ? await readJson<Article>(lp) : null;
       risk = computeRisk(live, pend);
+      const parts = await diffParts(live, pend);
+      if (parts.length) changed = parts; // authoritative; fall back to e.changed if no live
     } catch {
-      // unreadable pending file -> treat as no risk info
+      // unreadable pending file -> keep the manifest's recorded `changed`/no risk info
     }
 
     if (opts.dryRun) {
-      items.push({ typeKey: e.typeKey, id: e.id, title: e.title, risk, action: "preview" });
+      items.push({
+        typeKey: e.typeKey,
+        id: e.id,
+        title: e.title,
+        risk,
+        changed,
+        action: "preview",
+      });
       kept.push(e);
       continue;
     }
@@ -121,14 +137,28 @@ export async function approve(opts: ApproveOpts): Promise<ApproveResult> {
     if (opts.reject) {
       await Deno.remove(pp).catch(() => {});
       rejected++;
-      items.push({ typeKey: e.typeKey, id: e.id, title: e.title, risk, action: "rejected" });
+      items.push({
+        typeKey: e.typeKey,
+        id: e.id,
+        title: e.title,
+        risk,
+        changed,
+        action: "rejected",
+      });
       continue;
     }
 
     if (risk.length && !opts.includeRisky) {
       heldRisky++;
       kept.push(e); // stays pending until explicitly included
-      items.push({ typeKey: e.typeKey, id: e.id, title: e.title, risk, action: "held-risky" });
+      items.push({
+        typeKey: e.typeKey,
+        id: e.id,
+        title: e.title,
+        risk,
+        changed,
+        action: "held-risky",
+      });
       continue;
     }
 
@@ -143,21 +173,23 @@ export async function approve(opts: ApproveOpts): Promise<ApproveResult> {
       id: e.id,
       title: e.title,
       risk,
+      changed,
       action: "promoted",
       archived,
     });
+    const notes = [changeKind(changed)];
+    if (archived) notes.push("replaced file archived");
+    if (risk.length) notes.push(`risk: ${risk.join(",")}`);
     opts.changelog?.record({
       op: "edited",
       documentType: docType,
       id: e.id,
       title: e.title,
-      changed: e.changed,
+      changed,
       hashOld: e.hashOld,
       hashNew: e.hashNew,
       source: "approve",
-      detail: archived
-        ? `replaced live file archived${risk.length ? ` (risk: ${risk.join(",")})` : ""}`
-        : undefined,
+      detail: notes.join("; "),
     });
   }
 

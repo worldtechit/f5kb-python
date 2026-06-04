@@ -147,9 +147,13 @@ rules below — keep them readable for humans AND unambiguous for LLMs. Apply to
   dir starting with `_` so `track`/`status` never index them as article types (a real
   type dir is a sanitized type key, which never starts with `_`).
 - **The gate stages; `approve` applies.** A staged edit is NOT in the DB and NOT
-  logged as applied to the changelog until `approve` promotes it; `approve` recomputes
-  risk fresh from the files and holds body-dropped/body-error edits unless
-  `--include-risky`.
+  logged as applied to the changelog until `approve` promotes it. `approve` recomputes,
+  fresh from the live-vs-pending files, both the risk flags (holds body-dropped/
+  body-error unless `--include-risky`) and the `changed` parts (`metadata` and/or
+  `content`). Its changelog is ON by default (like `sync`) — promotions log
+  op="edited", source="approve", with `changed` + a metadata-only/metadata+content
+  `detail`; `--no-changelog` opts out. (The DB `changes` table also records the
+  metadata/content split via `diffFields`.)
 - **`config.yaml` is curated — excluded from `deno fmt`.** `deno fmt` reformats YAML;
   `config.yaml` is in the fmt `exclude` so a bare `deno fmt` won't rewrite it. Don't
   reformat it; hand-edit only.

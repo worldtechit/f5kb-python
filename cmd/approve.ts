@@ -16,7 +16,8 @@
 //   --reject            discard the staged files instead of promoting them
 //   --include-risky     also promote edits flagged risky (default: hold them back)
 //   --no-archive        don't keep a _replaced/ copy of overwritten files
-//   --changelog[=FILE]  record promotions to a JSONL changelog
+//   --changelog[=FILE]  changelog path (default <dump>/_changelog.jsonl; ON by default)
+//   --no-changelog      disable the changelog
 //   --json              print the result as JSON on STDOUT
 
 import { type ParsedArgs } from "../lib/args.ts";
@@ -51,7 +52,12 @@ export async function run(
   const asJson = flagBool(flags, "json");
 
   const nowMs = deps.nowMs ?? Date.now();
-  const changelogPath = changelogPathFromFlag(flags["changelog"], dump);
+  // Changelog defaults ON for approve (this is the moment edits actually hit live
+  // data, so it belongs in the history); --no-changelog disables, --changelog=FILE
+  // redirects. A --list/--reject run records nothing regardless.
+  const changelogPath = flagBool(flags, "no-changelog")
+    ? null
+    : changelogPathFromFlag(flags["changelog"] ?? true, dump);
   const changelog = new Changelog(changelogPath, new Date(nowMs).toISOString());
 
   const result = await approve({
@@ -80,10 +86,11 @@ export async function run(
     return 0;
   }
 
-  // Human summary: list each item with its risk flags.
+  // Human summary: list each item with its change kind + any risk flags.
   for (const it of result.items) {
+    const kind = it.changed.length ? `  (${it.changed.join("+")})` : "";
     const risk = it.risk.length ? `  [risk: ${it.risk.join(", ")}]` : "";
-    logger.info(`  ${it.action.padEnd(15)} ${it.typeKey}/${it.id}${risk}`);
+    logger.info(`  ${it.action.padEnd(15)} ${it.typeKey}/${it.id}${kind}${risk}`);
   }
   if (list) {
     logger.info(

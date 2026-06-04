@@ -114,8 +114,9 @@ file untouched. Nothing is overwritten until you approve it.
 
        deno task approve --list
 
-   Each line shows the article and any RISK flags (e.g. `body-dropped` means the new
-   version would lose a body your current file has).
+   Each line shows the article, what the edit touches in parentheses —
+   `(metadata-only)`, `(content-only)`, or `(metadata+content)` — and any RISK flags
+   (e.g. `body-dropped` means the new version would lose a body your current file has).
 
 2. Compare a staged change against what you have now (any diff tool works):
 
@@ -127,7 +128,10 @@ file untouched. Nothing is overwritten until you approve it.
        deno task approve
 
    Each replaced file is archived under `outputs/dump/_replaced/` first, then the DB
-   is updated. Anything risky is left pending and listed.
+   is updated. Anything risky is left pending and listed. Every promotion is recorded
+   to the changelog by default (op="edited", source="approve", with whether it changed
+   metadata, content, or both) — add `--no-changelog` to skip that, or
+   `--changelog=FILE` to redirect it.
 
 4. For a risky change you've checked and want anyway:
 

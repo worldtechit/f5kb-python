@@ -93,3 +93,34 @@ Deno.test("archiveReplaced: moves the live file into _replaced/", async () => {
     await Deno.remove(out, { recursive: true });
   }
 });
+
+Deno.test("diffParts / changeKind: metadata vs content", async () => {
+  const { diffParts, changeKind } = await import("../../lib/staging.ts");
+  const A = (meta: Record<string, unknown>, body: string) => ({
+    metadata: meta,
+    content: { body_text: body },
+  });
+  // metadata changed only
+  assertEquals(await diffParts(A({ v: 1 }, "x"), A({ v: 2 }, "x")), ["metadata"]);
+  // content changed only
+  assertEquals(await diffParts(A({ v: 1 }, "x"), A({ v: 1 }, "y")), ["content"]);
+  // both
+  assertEquals(await diffParts(A({ v: 1 }, "x"), A({ v: 2 }, "y")), ["metadata", "content"]);
+  // identical -> none
+  assertEquals(await diffParts(A({ v: 1 }, "x"), A({ v: 1 }, "x")), []);
+  // volatile content keys are ignored (a re-fetch stamp is not a content change)
+  assertEquals(
+    await diffParts(
+      { metadata: { v: 1 }, content: { body_text: "x", fetchedAt: "t1" } },
+      { metadata: { v: 1 }, content: { body_text: "x", fetchedAt: "t2" } },
+    ),
+    [],
+  );
+  // no live counterpart -> []
+  assertEquals(await diffParts(null, A({ v: 1 }, "x")), []);
+
+  assertEquals(changeKind(["metadata", "content"]), "metadata+content");
+  assertEquals(changeKind(["metadata"]), "metadata-only");
+  assertEquals(changeKind(["content"]), "content-only");
+  assertEquals(changeKind([]), "no-op");
+});
