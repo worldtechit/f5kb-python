@@ -724,6 +724,27 @@ const enrichDocPage: Enricher = async (article, nowIso) => {
       bodyError: `redirected into F5 KB ${km?.[1] ?? finalUrl}; body captured under its Salesforce type`,
     };
   }
+  // A specific page (X.html) that redirects to a directory/landing root means the
+  // original article was moved/removed; the landing page is not the article, so
+  // capturing its body would be wrong content (don't).
+  const reqPath = new URL(url).pathname;
+  const finPath = new URL(finalUrl).pathname;
+  // Redirected onto a directory/landing root (ends in "/") AND either the request
+  // was a specific file (basename has an extension) or it landed under a different
+  // top-level section than requested => the original page moved/removed and the
+  // landing page is not the article. (A bare trailing-slash normalization keeps
+  // the same first segment with no extension, so it is not flagged.)
+  const seg1 = (p: string) => p.split("/").filter(Boolean)[0] ?? "";
+  if (
+    finalUrl !== url && finPath.endsWith("/") &&
+    (/\/[^/]+\.[a-z0-9]+$/i.test(reqPath) || seg1(reqPath) !== seg1(finPath))
+  ) {
+    return {
+      bodySource: finalUrl,
+      fetchedAt: nowIso,
+      bodyError: `redirected to landing page ${finalUrl} (original page moved/removed)`,
+    };
+  }
   let body_text = "";
   if (rule?.nextData) {
     body_text = extractNextDataBody(html);
@@ -739,6 +760,14 @@ const enrichDocPage: Enricher = async (article, nowIso) => {
   }
   if (body_text.length < 40) {
     throw new Error(`extracted body too short (${body_text.length} chars)`);
+  }
+  // Some hosts (techdocs) serve a "Page Not Found" page with HTTP 200 — its body
+  // would otherwise be captured as the article. Reject it.
+  if (
+    /^#{0,3}\s*404 - Page Not Found/.test(body_text) ||
+    /the page you are looking for does not exist/i.test(body_text.slice(0, 400))
+  ) {
+    return { bodySource: finalUrl, fetchedAt: nowIso, bodyError: "soft 404 (HTTP 200 'Page Not Found')" };
   }
   return { body_text, bodySource: finalUrl, fetchedAt: nowIso };
 };
