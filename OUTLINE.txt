@@ -1,228 +1,337 @@
-Outline — Script Flows, Strategies & Decisions
-==============================================
+Outline — Code Layout, Flows & Decisions
+========================================
 
-How the scripts in this repo work, the strategies they use to get complete/correct
-data out of a hostile API, and the decisions (and war stories) behind them.
+How f5kb is built: the module tree, the dump->enrich->track flow through the
+modules, the design that makes offline testing possible, and the strategies (and
+war stories) for getting complete/correct data out of a hostile API.
 
-This file is about our code and approach. For discoveries about the *thing we
-scrape* (my.f5.com / Coveo internals, field meanings, counts), see FINDINGS.txt.
-For usage (flags, examples), see README.txt.
+This file is about our code and approach. For discoveries about the thing we scrape
+(my.f5.com / Coveo internals, field meanings, counts), see FINDINGS.txt. For usage
+(subcommands, flags, examples), see README.txt.
 
 1. THE BIG PICTURE
 ------------------
 
 The goal: build and maintain a local, full-fidelity index of F5 Knowledge Base
-articles — metadata and full body text — for every document type, with no
-login, and be able to track changes over time.
+articles — metadata and full body text — for every document type, with no login,
+and track changes over time.
 
-There is no public REST API. The only public path is the Coveo guest-token
-search backend that powers my.f5.com (see FINDINGS.txt → Token / Credential
-Discovery). Everything flows from a token fetched at runtime from a Salesforce
-Aura endpoint.
+There is no public REST API. The only public path is the Coveo guest-token search
+backend that powers my.f5.com (see FINDINGS.txt -> Token / Credential Discovery).
+Everything flows from a token fetched at runtime from a Salesforce Aura endpoint.
 
-The production pipeline is three single-purpose scripts run in sequence:
+The whole toolkit is one CLI, `f5kb.ts`, dispatching to thin per-subcommand
+wrappers in `cmd/*.ts`; all heavy logic lives in `lib/`. The production pipeline is
+three subcommands run in sequence:
 
-    dump_articles.ts   →   enrich_bodies.ts   →   track_articles.ts
-    (metadata + index      (fill bodies the          (master overview +
-     body, per article)     index doesn't have)        change tracking)
-            │                      │                          │
-       outputs/dump/<Type>/<id>.json  (one file per article)   outputs/articles.db
+    f5kb dump    ->   f5kb enrich    ->   f5kb track
+    (metadata +       (fill bodies the     (master overview +
+     indexed body,     index doesn't have)  change tracking)
+     per article)            |                     |
+          |          outputs/dump/<Type>/<id>.json  outputs/articles.db
 
-The other scripts are lighter-weight / exploratory tools that predate the pipeline
-(`fetch_f5_articles.ts`, `fetch_f5_articles_flex.ts`, `fetch_recent_by_type.ts`,
-`discover_products.ts`). They share the same token + Coveo plumbing.
+`f5kb status` is a read-only health report over a dump + its DB. The remaining
+subcommands (fetch, recent, list-types, list-products, discover) are lighter-weight
+/ exploratory tools that predate the pipeline; they share the same token + Coveo
+plumbing in `lib/coveo/`.
 
-Decision — three separate scripts, not one monolith. Each stage has very
-different concerns (Coveo paging vs HTML/JSON scraping vs local DB upserts), failure
-modes, and rerun cadence. Keeping them separate keeps each testable, independently
-re-runnable, and resumable. `enrich_bodies.ts` and `track_articles.ts` are
-post-processors that read the dump directory, so they can run anytime and as often
-as needed without re-hitting the search API.
+Decision — one CLI with subcommands, not seven scripts. The toolkit began as seven
+standalone scripts. They were consolidated into a single `f5kb` entry plus a `lib/`
+module tree (see §8). Each stage still has very different concerns (Coveo paging vs
+HTML/JSON scraping vs local DB upserts), failure modes, and rerun cadence, so the
+subcommands stay independently re-runnable and resumable; enrich and track are
+post-processors that read the dump directory and never re-hit the search API.
 
-2. PER-SCRIPT FLOW
-------------------
+2. MODULE TREE
+--------------
 
-dump_articles.ts — full-fidelity metadata dump
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    f5kb.ts                 entry: COMMANDS map (desc + flag synopsis + lazy
+                            loader), global-flag parse, usage/--help/--version,
+                            dispatch, top-level try/catch -> exit code.
+    cmd/                    one thin wrapper per subcommand (parse subcommand flags,
+                            call into lib, return an exit code):
+      dump.ts enrich.ts track.ts status.ts fetch.ts recent.ts
+      list_types.ts list_products.ts discover.ts
+    lib/
+      coveo/
+        aura.ts             fetch the guest token from the Aura endpoint
+                            (double-parse JSON-in-JSON); CoveoConfig +
+                            refreshConfig.
+        client.ts           CoveoClient: post() (retry/backoff/refresh/timeout),
+                            getCount(), listFacetValues(). Takes an injected fetch.
+        paging.ts           fetchPaged (offset), fetchKeyset (@rowid cursor),
+                            fetchChunked (date-window split). The §4 strategy.
+        dates.ts            @date <-> ms helpers (toCoveoDate, the 1s resolution).
+        fields.ts           split a Coveo result into metadata/content per config;
+                            build the per-type field catalogue.
+        flat.ts             the 5-field flat shape, buildAq, fetchFlatPaged/
+                            fetchFlatChunked, toCSV (for fetch/recent).
+      http/
+        fetcher.ts          HttpClient: plain-page GET with retry/backoff/timeout
+                            and a descriptive User-Agent. Takes an injected fetch.
+        github.ts           GitHub REST helpers (issue/pull/README/raw file).
+      html/
+        serialize.ts        DOM subtree -> markdown (headings/lists/code/links).
+        bugtracker.ts       Bug Tracker page -> labelled sections (2 templates).
+        docpage.ts          doc-site host->selector map + fallbacks; soft-404 and
+                            landing-redirect detection.
+        nextdata.ts         read a body from embedded __NEXT_DATA__ JSON.
+      enrich/
+        enrichers.ts        per-type enricher registry (Bug Tracker, F5 GitHub,
+                            Manual/Release Note/Supplemental via docpage).
+        driver.ts           walk the dump, resumability gate, dispatch, write
+                            content + _enrich_report.json.
+      track/
+        hashing.ts          canonicalize + SHA-256 metadata/content hashes
+                            (volatile keys excluded).
+        db.ts               node:sqlite schema + upsert + classify + runs/changes.
+      config/
+        loader.ts           load+normalize config.yaml; refreshConfig helper.
+        types.ts            TypeConfig / ProductEntry / config shapes.
+      dump.ts               the dump orchestration (count -> page -> split ->
+                            write per-article + catalogue + _index.json).
+      status.ts             aggregate _index.json + _enrich_report.json + on-disk
+                            counts + DB into a StatusReport.
+      logger.ts             leveled logger -> STDERR (text or NDJSON).
+      progress.ts           progress reporting helper.
+      args.ts               parseFlags + flagStr/flagNum/flagBool/flagList +
+                            logLevelFromFlags.
+      fsutil.ts             readJson/writeJson, listTypeDirs, sanitizeName, exists.
+      version.ts            VERSION constant.
+    config.yaml             types: + field_descriptions: + products: (see README).
+    test/                   unit / integration / regression + fixtures (see §7).
 
-1. Fetch a Coveo guest token via the Aura `HeadlessController.getHeadlessConfiguration`
-   call (double-parse the JSON-in-JSON response).
-2. Load `dump_config.yaml` (per-type `documentType`, `metadata` keep-list, `content`
-   keep-list) and `field_descriptions.yaml` (field descriptions, for the catalogue).
-3. For each requested type:
+3. THE PIPELINE FLOW THROUGH THE MODULES
+----------------------------------------
+
+f5kb dump (cmd/dump.ts -> lib/dump.ts)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+1. Fetch a Coveo guest token via lib/coveo/aura.ts (Aura
+   HeadlessController.getHeadlessConfiguration; double-parse the JSON-in-JSON).
+2. Load config.yaml via lib/config/loader.ts (per-type documentType + metadata
+   keep-list + content keep-list; the field_descriptions: section annotates the
+   catalogue).
+3. For each requested type, via a CoveoClient (lib/coveo/client.ts):
    - Get the server count (validation target).
-   - Fetch every article — see §3 Pagination for `--days` (date-chunk) vs `--all`
-     (whole-type `@rowid` keyset).
-   - Request all fields (no `fieldsToInclude`); split each result into
-     `metadata` / `content` objects per the config; write one JSON per article to
-     `outputs/dump/<TypeKey>/<id>.json`.
-   - Write a per-type field catalogue (`_catalogue.json`/`.md`): every field
-     seen, its source/type/coverage/sample. (Workflow: dump once with `metadata:"*"`,
-     read the catalogue, then curate the config to an explicit keep-list.)
-4. Write `_index.json` (per-type status ok/partial/failed + written-vs-server counts).
-   Exit non-zero if any type failed.
+   - Fetch every article — see §4 for --days (date-chunk) vs --all (@rowid keyset),
+     in lib/coveo/paging.ts.
+   - Split each result into metadata/content per the config (lib/coveo/fields.ts);
+     write one JSON per article to outputs/dump/<TypeKey>/<id>.json.
+   - Write the per-type field catalogue (_catalogue.json/.md): every field seen,
+     its source/type/coverage/sample.
+4. Write _index.json (per-type status ok/partial/failed + written-vs-server
+   counts). Exit non-zero if any type failed.
 
-enrich_bodies.ts — body recovery for the 5 empty-index types
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-The Coveo index returns no body field for Manual / Release Note / Supplemental
-Document / Bug Tracker / F5 GitHub (their `content` is left `{}`). This post-processor
-fills `content` from each article's public page.
-1. Walk `outputs/dump/<Type>/*.json` for the requested types.
-2. Resumability gate: skip an article that already has `body_text` or a recorded
-   `bodyError` (unless `--refetch`, or `--refetch-errors` to retry only the errored).
-3. Dispatch per type via a `TYPE_ENRICHERS` registry:
-   - Bug Tracker → deterministic `cdn.f5.com/product/bugtracker/ID<id>.html`;
-     extract only the labelled body sections. Two templates: standard
-     (`div.bug-content`: Symptoms/Impact/…) and security/CVE (labelled fields →
-     CVE / Related Article / Vulnerability Severity).
-   - Manual / Release Note / Supplemental Document → doc-page scrape via a
-     `HOST_RULES` host→CSS-selector map + generic fallback + last-resort `<pre>`/`<body>`;
-     `docs.cloud.f5.com` (Next.js) reads the body from embedded `__NEXT_DATA__` JSON
-     instead of the DOM.
-   - F5 GitHub → GitHub REST API (issues/pulls/README/raw file), not HTML.
-4. Extract only the body as markdown (headings/lists/code/links resolved to
-   absolute), strip site chrome and anything that duplicates metadata. Write
-   `content.body_text` (+ `content.sections` where labelled) + `bodySource` +
-   `fetchedAt`, or `content.bodyError` on failure.
-5. Write `_enrich_report.json` (per-type enriched/failed/skipped + errored items).
-
-track_articles.ts — master overview & change tracking
+f5kb enrich (cmd/enrich.ts -> lib/enrich/driver.ts)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-1. Walk the dump; for each article compute: identity, the several dates
-   (created/original-published/updated-published/modified/captured), a
-   metadata hash and a content hash (SHA-256 over canonicalized JSON, with
-   volatile `bodySource`/`fetchedAt` excluded so a re-fetch isn't a "change"),
-   `has_body`, `body_error`.
-2. Upsert into `outputs/articles.db` (node:sqlite). Compare to the stored row →
-   classify new / changed / unchanged; log every change to a `changes` table and
-   a per-run summary to a `runs` table. Removed = rows in the scanned types absent
-   from this dump (logged, not deleted).
+The Coveo index returns no body for Manual / Release Note / Supplemental Document /
+Bug Tracker / F5 GitHub (content left empty). This post-processor fills content
+from each article's public page.
+1. Walk outputs/dump/<Type>/*.json for the requested types.
+2. Resumability gate: skip an article that already has body_text or a recorded
+   bodyError (unless --refetch, or --refetch-errors to retry only the errored).
+3. Dispatch per type via the enricher registry (lib/enrich/enrichers.ts):
+   - Bug Tracker -> deterministic cdn.f5.com page; lib/html/bugtracker.ts extracts
+     the labelled sections (standard + security/CVE templates).
+   - Manual / Release Note / Supplemental Document -> lib/html/docpage.ts
+     (host->selector map + generic + <pre>/<body> fallback); docs.cloud.f5.com
+     (Next.js) reads the body from embedded __NEXT_DATA__ via lib/html/nextdata.ts.
+   - F5 GitHub -> GitHub REST API (lib/http/github.ts), not HTML.
+4. Extract only the body as markdown (lib/html/serialize.ts; links absolutized),
+   strip chrome and metadata duplication. Write content.body_text (+ sections),
+   bodySource, fetchedAt, or content.bodyError on failure.
+5. Write _enrich_report.json (per-type enriched/failed/skipped + errored items).
 
-Exploratory tools (pre-pipeline)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+f5kb track (cmd/track.ts -> lib/track/db.ts)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-- `fetch_f5_articles.ts` — hardcoded BIG-IP + Support Solution flat fetch.
-- `fetch_f5_articles_flex.ts` — any product/type; `--list-types`, `--list-products`,
-  `--discover-products`.
-- `fetch_recent_by_type.ts` — last-N-days, one JSON per type.
-- `discover_products.ts` — product discovery via global facet → `supplemental_products.json`.
+1. Walk the dump; for each article compute identity, the several dates
+   (created/original-published/updated-published/modified/captured), a metadata
+   hash and a content hash (lib/track/hashing.ts: SHA-256 over canonicalized JSON,
+   with volatile bodySource/fetchedAt excluded so a re-fetch isn't a "change"),
+   has_body, body_error.
+2. Upsert into outputs/articles.db (node:sqlite). Compare to the stored row ->
+   classify new / changed / unchanged; log every change to a changes table and a
+   per-run summary to a runs table. Removed = rows in the scanned types absent from
+   this dump (logged, not deleted).
 
-3. PAGINATION STRATEGY (THE CORE OBSTACLE)
+f5kb status (cmd/status.ts -> lib/status.ts)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Read-only. Aggregates _index.json, _enrich_report.json, on-disk per-type counts,
+and the DB (articles/runs) into a StatusReport; renders a table or, with --json, a
+JSON payload. Each source is handled gracefully when absent.
+
+4. PAGINATION STRATEGY (THE CORE OBSTACLE)
 ------------------------------------------
 
-Coveo enforces a hard cap: `firstResult + numberOfResults ≤ 5000`. Two strategies,
-chosen by mode:
+Lives in lib/coveo/paging.ts. Coveo enforces a hard cap:
+firstResult + numberOfResults <= 5000. Two strategies, chosen by mode:
 
-- `--days=N` → recursive date-window chunking. Split on `@date>=…@date<…`,
-  recursively halving any window whose count exceeds 5,000, then offset-page each
-  leaf. Then refine client-side to the exact content-mod window. Good for recency.
-- `--all` → keyset (cursor) pagination by `@rowid`. No date window at all. Sort
-  `@rowid ascending`, page with `@rowid>=cursor`. No offset cap, and it captures
-  articles a date window would miss.
+  - --days=N (and fetch/recent over a window) -> recursive date-window chunking
+    (fetchChunked). Split on @date>=...@date<..., recursively halving any window
+    whose count exceeds 5,000, then offset-page each leaf. Then refine client-side
+    to the exact content-mod window. Good for recency.
+  - --all -> keyset (cursor) pagination by @rowid (fetchKeyset). No date window at
+    all. Sort @rowid ascending, page with @rowid>=cursor. No offset cap, and it
+    captures articles a date window would miss.
 
 Why keyset was necessary (war story). A full-corpus dump came up short on the two
-largest types, and the built-in count-validation flagged it. Root causes, found with
-throwaway probe scripts:
-- `@date` filtering is only 1-second resolution; a bulk re-index stamped 12,992
-  Manual articles with the identical `@date` second → irreducible by date → the
-  5,000 cap silently dropped ~8k.
-- Date-range queries silently exclude null / out-of-window `@date` docs
-  (Release_Note: bare 757 vs windowed 726).
+largest types, and the built-in count-validation flagged it. Root causes:
+  - @date filtering is only 1-second resolution; a bulk re-index stamped 12,992
+    Manual articles with the identical @date second -> irreducible by date -> the
+    5,000 cap silently dropped ~8k.
+  - Date-range queries silently exclude null / out-of-window @date docs
+    (Release_Note: bare 757 vs windowed 726).
 
-Keyset by `@rowid` fixes both. Picking the cursor field mattered:
-`@permanentid`/`@urihash`/`@f5_kb_id` are not sortable (`InvalidSortField`); only
-`@rowid` (a.k.a. `@sysrowid`) is sortable, unique, and monotonic. Gotcha: `@rowid`
-(~1.8e18) exceeds JS's safe-integer range, so `JSON.parse` rounds it (ULP ~256) — the
-cursor backs off a 4096 margin and uses `>=` + permanentid dedup so a boundary doc is
+Keyset by @rowid fixes both. Picking the cursor field mattered:
+@permanentid / @urihash / @f5_kb_id are not sortable (InvalidSortField); only
+@rowid (a.k.a. @sysrowid) is sortable, unique, and monotonic. Gotcha: @rowid
+(~1.8e18) exceeds JS's safe-integer range, so JSON.parse rounds it (ULP ~256) — the
+cursor backs off a margin and uses >= + permanentid dedup so a boundary doc is
 re-fetched-and-deduped rather than skipped.
 
-Other Coveo limits handled: the 20 MB response cap (auto-halve the page size and
-retry that page) and the 5,000-offset cap (above).
+Other Coveo limits handled here: the 20 MB response cap (auto-halve the page size
+and retry that page, in fetchPaged/the dump) and the 5,000-offset cap (above).
 
-4. CROSS-CUTTING STRATEGIES
+5. THE DEPENDENCY-INJECTION DESIGN (= OFFLINE TESTS)
+----------------------------------------------------
+
+Both network surfaces are dependency-injected: CoveoClient (lib/coveo/client.ts)
+and HttpClient (lib/http/fetcher.ts) each take a `fetch` function rather than
+calling the global directly. In production they get the real `fetch`; in tests they
+get a mock (test/_helpers/mock_fetch.ts) that returns Response objects built from
+in-memory text or committed fixtures, and a no-op sleep so retry/backoff paths run
+instantly.
+
+This is what makes the whole suite run offline and deterministically. The
+retry/backoff/refresh/timeout logic, the pagination strategies, the HTML/JSON
+parsers, and the full subcommand wrappers are all exercised without a network — the
+mock can script per-call replies (to simulate 401-then-200 refresh, 503 retries,
+20 MB-size errors, multi-page keyset cursors, etc.) and record the calls made so a
+test can assert exactly which queries were issued. Live tests are opt-in (F5_LIVE=1)
+and are the only ones that touch the real API.
+
+6. CROSS-CUTTING STRATEGIES
 ---------------------------
 
-- Token management. Fetched once at start; `coveoPost` auto-refreshes on
-  401/419 in place (a full dump can outlive the ~24h guest JWT).
-- Retry/backoff. Transient network errors + HTTP 429/5xx retried 5× with
-  exponential backoff (750ms·2ⁿ). HTTP 4xx (gone/restricted) are terminal.
-- Per-request timeout (no-hang). `fetch()` has no default timeout; a socket that
-  dies mid-request (machine sleep / connectivity drop) would hang forever and never
-  reach the retry path. A 60s `AbortController` turns a stall into a rejection the
-  retry handles. (Added after a real sleep-induced hang during a dump.)
-- Per-type error isolation. In the dump, one type failing never aborts the run;
-  status is recorded per type and the driver re-runs just the failures via `--types=`.
-- Count validation. The dump compares written-vs-server per type and marks
-  `partial`/`failed`; this is the tripwire that caught every completeness bug.
-- Resumability everywhere. All output is per-article files + idempotent upserts.
-  Enrichment skips already-done articles; `--refetch-errors` retries only failures
-  (e.g. after mapping a new host or fixing a parser). Nothing needs a clean restart.
-- Error classification over silent junk. When a page can't yield a real body, we
-  record a descriptive `content.bodyError` rather than capture nav/landing/404 text.
-  This keeps the data trustworthy and makes gaps visible and re-runnable.
-- Politeness. Concurrency pool (default 4–8) + per-worker delay + descriptive
-  User-Agent for scraping.
-- Subagents for audit. Read-only subagents fan out to sample/verify output
-  quality and research open questions; the main thread fixes what they find. (Used to
-  validate all ~70k enriched bodies and to research the techdocs template.)
+  - Token management (lib/coveo/aura.ts + client.ts). Fetched once at start;
+    CoveoClient.post auto-refreshes on 401/419 in place (a full dump can outlive
+    the ~24h guest JWT).
+  - Retry/backoff. Transient network errors + HTTP 429/5xx retried with
+    exponential backoff. HTTP 4xx (gone/restricted) are terminal.
+  - Per-request timeout (no-hang). fetch() has no default timeout; a socket that
+    dies mid-request would hang forever and never reach the retry path. An
+    AbortController turns a stall into a rejection the retry handles. (Added after a
+    real sleep-induced hang during a dump.)
+  - Per-type error isolation. In the dump, one type failing never aborts the run;
+    status is recorded per type and the operator re-runs just the failures via
+    --types=.
+  - Count validation. The dump compares written-vs-server per type and marks
+    partial/failed; this is the tripwire that caught every completeness bug.
+  - Resumability everywhere. All output is per-article files + idempotent upserts.
+    Enrichment skips already-done articles; --refetch-errors retries only failures.
+    Nothing needs a clean restart.
+  - Error classification over silent junk. When a page can't yield a real body, we
+    record a descriptive content.bodyError rather than capture nav/landing/404
+    text. This keeps the data trustworthy and makes gaps visible and re-runnable.
+  - Politeness. Concurrency pool + per-worker delay + descriptive User-Agent for
+    scraping.
+  - Output discipline. Logs/progress -> STDERR (lib/logger.ts); machine output
+    (--json) -> STDOUT, so a --json payload can be piped cleanly.
 
-5. KEY DECISION POINTS (AND WHY)
+7. TESTING APPROACH
+-------------------
+
+101 tests, all offline by default, under test/ in three categories:
+
+  - unit (16 files) — one module's functions in isolation (paging, client,
+    aura/config, dates, fields, the HTML parsers, hashing, args, logger, status,
+    github, fsutil). Network is the mock; backoff sleeps are no-ops.
+  - integration (5 files) — a full subcommand wrapper end to end against the mock
+    fetch and a temp dir (dump, enrich, track, status, the flat fetch).
+  - regression (4 files) — lock the on-disk contracts: the 9-key article envelope,
+    the catalogue row schema + markdown table, the SQLite schema (tables / indexes
+    / columns / PK), and the enrich output shape. These guard the
+    behavior-unchanged guarantee from the consolidation.
+
+Fixtures live in test/fixtures/ (Aura token response, Coveo facet/search/count
+JSON, a dump_mini covering every type, GitHub API JSON, and real doc/bug HTML
+pages). Helpers in test/_helpers/: mock_fetch.ts (route + scripted modes, noop
+sleep, stub refresh), fixtures.ts (loader), and header.ts (the canonical
+standard test-file header every test copies: purpose / category / covers /
+fixtures / network / asserts).
+
+Run: `deno task test` (offline) or `deno task test:live` (F5_LIVE=1, hits the net).
+The offline task runs with --allow-read; the integration/regression tests that
+write a temp dir need --allow-write too (deno test --allow-read --allow-write).
+
+8. KEY DECISION POINTS (AND WHY)
 --------------------------------
 
-- No headless browser — ever. Two sites looked client-rendered
-  (`docs.cloud.f5.com`, newer `techdocs.f5.com`). Investigation showed the body is
-  always reachable without a browser: docs.cloud embeds it in `__NEXT_DATA__` JSON;
-  techdocs renders the real topic body server-side (the pages that looked empty were
-  genuinely empty stubs). Headless was never needed, not even for discovery.
-- `@rowid` keyset as the canonical full-corpus pager (over date-chunking) — see §3.
-- SQLite (node:sqlite) for the master overview, not one big JSON. Upserting 100k+
-  rows and querying "what changed since run X" is far cheaper, and node:sqlite ships
-  with Deno (no dependency). Content hash excludes volatile keys so re-fetches aren't
-  false changes.
-- Extract only the body; never duplicate metadata. Bug Tracker header block,
-  doc-site nav/header/footer, Sphinx ¶ permalinks, etc. are all stripped — the dump
-  metadata already has the rest.
-- Consolidate generated data under `outputs/` and gitignore it. Code + curated
-  config + docs are versioned; large regenerable data is not. `*.db` and `.claude`
-  runtime files are also ignored.
-- Record cross-references instead of re-scraping. docs.nginx.com URLs that 302
-  into the F5 KB point at a Salesforce article we already capture under its own type;
-  we record the K-id rather than scrape the my.f5.com SPA.
+  - One CLI + lib over seven scripts. Consolidating removed duplicated token/Coveo
+    plumbing, made the network injectable (-> offline tests), and gave a single
+    --help surface. The seven scripts and their three config files (a per-type
+    keep-list YAML, a field-description YAML, a discovered-products JSON) were
+    retired; their config merged into config.yaml's three sections. Output formats
+    and flag semantics were kept byte-identical (verified by the regression tests
+    and a before/after dump diff).
+  - No headless browser — ever. Two sites looked client-rendered
+    (docs.cloud.f5.com, newer techdocs.f5.com). The body is always reachable
+    without a browser: docs.cloud embeds it in __NEXT_DATA__ JSON; techdocs renders
+    the real topic body server-side (the pages that looked empty were genuinely
+    empty stubs).
+  - @rowid keyset as the canonical full-corpus pager (over date-chunking) — see §4.
+  - SQLite (node:sqlite) for the master overview, not one big JSON. Upserting 100k+
+    rows and querying "what changed since run X" is far cheaper, and node:sqlite
+    ships with Deno (no dependency). The content hash excludes volatile keys so
+    re-fetches aren't false changes.
+  - Extract only the body; never duplicate metadata. Bug Tracker header block,
+    doc-site nav/header/footer, Sphinx permalinks, etc. are stripped — the dump
+    metadata already has the rest.
+  - Consolidate generated data under outputs/ and gitignore it. Code + curated
+    config + docs are versioned; large regenerable data is not.
+  - Record cross-references instead of re-scraping. docs.nginx.com URLs that 302
+    into the F5 KB point at a Salesforce article we already capture under its own
+    type; we record the K-id rather than scrape the my.f5.com SPA.
 
-6. OBSTACLES OVERCOME (INDEX)
+9. OBSTACLES OVERCOME (INDEX)
 -----------------------------
 
-| Obstacle | Resolution |
-|----------|-----------|
-| 5,000-result offset cap | date-window chunking (`--days`) / `@rowid` keyset (`--all`) |
-| 20 MB response cap | auto-halve page size and retry the page |
-| Dense same-second `@date` cluster (>5,000 in 1s) | keyset by `@rowid` |
-| Null / out-of-window `@date` docs | `--all` keyset whole type (no date filter) |
-| Guest token expiry mid-run | refresh on 401/419 |
-| Hung socket after sleep / connectivity drop | 60s per-request `AbortController` timeout |
-| `--all` mod-date filter dropping a pre-2000 article | skip the filter under `--all` |
-| Coveo body absent for 5 doc types | off-API enrichment (`enrich_bodies.ts`) |
-| Multiple doc-site templates | host→selector map + generic + `<pre>`/`<body>` fallback |
-| `docs.cloud.f5.com` JS-rendered | parse embedded `__NEXT_DATA__` JSON |
-| Bug Tracker 2nd (CVE) template | labelled-field fallback parser |
-| Soft-404 pages (HTTP 200) | detect by body signature → `bodyError` |
-| Moved-to-landing redirects | detect file→dir-root / section change → `bodyError` |
-| docs.nginx.com → F5 KB migration | record K-id cross-reference |
-| GitHub 60/hr rate limit | `GITHUB_TOKEN` → 5,000/hr |
+  Obstacle                                          | Resolution
+  ------------------------------------------------- | --------------------------------
+  5,000-result offset cap                           | date-window chunking (--days) / @rowid keyset (--all)
+  20 MB response cap                                | auto-halve page size and retry the page
+  Dense same-second @date cluster (>5,000 in 1s)    | keyset by @rowid
+  Null / out-of-window @date docs                   | --all keyset whole type (no date filter)
+  Guest token expiry mid-run                        | refresh on 401/419
+  Hung socket after sleep / connectivity drop       | per-request AbortController timeout
+  --all mod-date filter dropping a pre-2000 article | skip the filter under --all
+  Coveo body absent for 5 doc types                 | off-API enrichment (f5kb enrich)
+  Multiple doc-site templates                       | host->selector map + generic + <pre>/<body> fallback
+  docs.cloud.f5.com JS-rendered                     | parse embedded __NEXT_DATA__ JSON
+  Bug Tracker 2nd (CVE) template                    | labelled-field fallback parser
+  Soft-404 pages (HTTP 200)                         | detect by body signature -> bodyError
+  Moved-to-landing redirects                        | detect file->dir-root / section change -> bodyError
+  docs.nginx.com -> F5 KB migration                 | record K-id cross-reference
+  GitHub 60/hr rate limit                           | GITHUB_TOKEN -> 5,000/hr
 
-7. OPERATING IT
----------------
+10. OPERATING IT
+----------------
 
-Full refresh (13 types, excludes Community + F5 GitHub by choice of the last run):
-    deno run --allow-net --allow-read --allow-write dump_articles.ts --all --out=outputs/dump --types="…"
-    deno run --allow-net --allow-read --allow-write --allow-env enrich_bodies.ts --dump=outputs/dump --types="Bug_Tracker,Manual,Release_Note,Supplemental_Document"
-    deno run --allow-read --allow-write track_articles.ts --dump=outputs/dump
-React to issues: check `_index.json` (re-run failed/partial types with `--types=`)
-and `_enrich_report.json` (fix host rule / parser, then `--refetch-errors`). Live
-corpus counts drift, so re-run any type whose dump shows a shortfall; `track_articles.ts`
-records the delta as new/changed/removed.
+Full refresh:
 
-Future (deferred, see `TODO.txt`): use the tracking DB to skip re-pulling a body
-when an article's dates + metadata hash are unchanged from the prior run.
+    deno task dump --all --out=outputs/dump --types="..."
+    deno task enrich --dump=outputs/dump --types="Bug_Tracker,Manual,Release_Note,Supplemental_Document"
+    deno task track --dump=outputs/dump
+    deno task status
+
+React to issues: check _index.json (re-run failed/partial types with --types=) and
+_enrich_report.json (fix the host rule / parser, then enrich --refetch-errors).
+Live corpus counts drift, so re-run any type whose dump shows a shortfall; `f5kb
+track` records the delta as new/changed/removed.
+
+Future (deferred, see TODO.txt): use the tracking DB to skip re-pulling a body when
+an article's dates + metadata hash are unchanged from the prior run.

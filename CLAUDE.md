@@ -13,44 +13,57 @@ runtime from a Salesforce Aura endpoint.
 
 ## Runtime & dependencies
 
-- **Deno 2.x** (`deno run …`). Not Node. Scripts are `.ts`, type-check with
-  `deno check <file>.ts`.
-- No package manifest. External deps are imported by URL: `jsr:@b-fuze/deno-dom`
-  (HTML parsing) and `jsr:@std/yaml`. `node:sqlite` is built into Deno (no install).
+- **Deno 2.x** (`deno run …` / `deno task …`). Not Node. Code is `.ts`; type-check
+  with `deno task check`.
+- No package manifest. Deps are declared in `deno.json` imports and fetched by URL:
+  `jsr:@b-fuze/deno-dom` (HTML parsing), `jsr:@std/yaml`, `jsr:@std/assert`,
+  `jsr:@std/testing`. `node:sqlite` is built into Deno (no install).
 - Typical perms: `--allow-net --allow-read --allow-write` (+ `--allow-env` for
-  `enrich_bodies.ts` to read `GITHUB_TOKEN`).
+  `f5kb enrich` to read `GITHUB_TOKEN`). `deno task` bakes these in per subcommand.
+
+## The CLI
+
+Everything is one entry point, `f5kb.ts`, with subcommands. `f5kb --help` lists
+them; `f5kb <sub> --help` shows that subcommand's flags. Subcommands: `dump`,
+`enrich`, `track`, `status`, `fetch`, `recent`, `list-types`, `list-products`,
+`discover`. Global flags: `--verbose`/`--debug`/`--quiet`/`--json-logs`/`--help`/
+`--version`. Logs/progress go to STDERR; any `--json` payload goes to STDOUT.
+
+`deno task` shortcuts (see `deno.json`): `dump`, `enrich`, `track`, `status`,
+`discover`, `check`, `test`, `test:live`, `fmt`, `lint`.
 
 ## The pipeline (run in order)
 
 ```
-dump_articles.ts  →  enrich_bodies.ts  →  track_articles.ts
+f5kb dump  →  f5kb enrich  →  f5kb track     (then f5kb status for a health report)
 ```
-1. **dump_articles.ts** (+ `dump_config.yaml`) — one JSON per article under
+1. **`f5kb dump`** (reads `config.yaml`) — one JSON per article under
    `outputs/dump/<Type>/<id>.json`, fields split into `metadata`/`content`. Use
    `--all` (full corpus) or `--days=N`; `--out`, `--types`.
-2. **enrich_bodies.ts** — fills `content` for the 5 types the Coveo index leaves
+2. **`f5kb enrich`** — fills `content` for the 5 types the Coveo index leaves
    empty (Bug_Tracker, Manual, Release_Note, Supplemental_Document, F5_GitHub).
    `--dump`, `--types`, `--refetch-errors`, `--concurrency`.
-3. **track_articles.ts** — SQLite master overview (`outputs/articles.db`):
-   per-article dates + metadata/content hashes; new/changed/unchanged/removed
-   across runs.
+3. **`f5kb track`** — SQLite master overview (`outputs/articles.db`): per-article
+   dates + metadata/content hashes; new/changed/unchanged/removed across runs.
 
-Exploratory tools (pre-pipeline): `fetch_f5_articles.ts`,
-`fetch_f5_articles_flex.ts`, `fetch_recent_by_type.ts`, `discover_products.ts`.
+Exploratory subcommands (predate the pipeline): `fetch`, `recent`, `list-types`,
+`list-products`, `discover`.
 
 ## Where the docs live (don't duplicate; update the right one)
 
-- **README.txt** — usage: every script, its flags, examples, output layout.
+- **README.txt** — usage: every subcommand, its flags, examples, output layout.
 - **FINDINGS.txt** — discoveries about the *scraped system* (Coveo token flow, API
   limits, field meanings, counts, deprecation/lifecycle). Appendix A is the full
   field inventory; the my.f5.com sitemap notes + gap analysis are in its "Sitemap"
   section.
-- **OUTLINE.txt** — our *code*: script flows, strategies, decisions, obstacles overcome.
+- **OUTLINE.txt** — our *code*: module tree, the dump→enrich→track flow, the
+  network-injection design, strategies, decisions, obstacles overcome.
 - **TODO.txt** — open work (sitemap-gap follow-up incl. the 47 IDs; the deferred
   "skip-unchanged bodies" idea).
-- Machine-read config (not docs): `dump_config.yaml` (per-type field keep-lists),
-  `field_descriptions.yaml` (field → description, annotates the catalogue),
-  `supplemental_products.json` (discovered products).
+- Machine-read config (not docs): `config.yaml` — three sections: `types:`
+  (per-type field keep-lists, read by `f5kb dump`), `field_descriptions:`
+  (field → description, annotates the catalogue), `products:` (read-only discovered-
+  product snapshot; `f5kb discover` writes `discovered_products.yaml` to copy in).
 
 ## Documentation file conventions (.txt rules)
 
@@ -71,27 +84,32 @@ going forward:
 - **Lists**: `  - item` (2-space indent, hyphen); nest with deeper indent.
 - **Wrap** prose to ~88 cols; one blank line between paragraphs; never >1 blank line.
 - **Cross-reference** other docs by filename (e.g. "see FINDINGS.txt").
-- If a `.txt`'s content is also needed by a script, keep the machine-read copy in a
-  YAML/JSON config and have the script read that — never make a script parse prose.
-  (Example: `field_descriptions.yaml` is the machine copy of FINDINGS.txt Appendix A.)
+- If a `.txt`'s content is also needed by code, keep the machine-read copy in a
+  YAML/JSON config and have the code read that — never make code parse prose.
+  (Example: `config.yaml`'s `field_descriptions:` section is the machine copy of
+  FINDINGS.txt Appendix A.)
 
 ## Conventions & gotchas
 
 - **`outputs/` is gitignored** (large regenerable data: dumps + `articles.db`). Commit
-  code, curated config (`dump_config.yaml`), docs, and `supplemental_products.json`.
-  `.claude/settings.local.json` and `.claude/*.lock` are also ignored.
+  code (`f5kb.ts`, `cmd/`, `lib/`, `test/`), curated config (`config.yaml`), and
+  docs. `.claude/settings.local.json` and `.claude/*.lock` are also ignored.
 - **No headless browser.** Every page's body is reachable via plain fetch — JS-rendered
   sites embed it in JSON (`__NEXT_DATA__`) or render it server-side. Don't add Puppeteer.
 - **Beating Coveo's 5,000-offset cap:** `--all` uses **keyset pagination by `@rowid`**
   (the only sortable/unique field; `@date` is 1-second-resolution and misses
-  null/out-of-window docs). See OUTLINE.txt §3.
+  null/out-of-window docs). See OUTLINE.txt §4.
 - **Live corpus drifts** — counts change between runs; that's expected. The dump
   validates written-vs-server and marks `partial`/`failed` in `_index.json`; re-run
   shortfalls with `--types=`. Enrichment failures land in `_enrich_report.json`; fix
   the host rule / parser then `--refetch-errors`.
 - **Trust via classification:** when a body can't be extracted, record a descriptive
   `content.bodyError` — never capture nav/landing/404 text as the body.
-- Scripts are resumable and idempotent; never assume a clean restart is required.
+- Subcommands are resumable and idempotent; never assume a clean restart is required.
+- **Network is dependency-injected.** `CoveoClient` (`lib/coveo/client.ts`) and
+  `HttpClient` (`lib/http/fetcher.ts`) each take a `fetch` fn; tests pass a mock
+  (`test/_helpers/mock_fetch.ts`), which is why the 101-test suite runs offline.
+  Don't reach for the global `fetch` directly in lib code.
 
 ## Git
 

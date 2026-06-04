@@ -1,21 +1,39 @@
 F5 ARTICLE DUMP — TODO
 ======================
 
-This file tracks open work. See OUTLINE.txt for how the scripts work and
-FINDINGS.txt for what we learned about the scraped system.
+This file tracks open work. See OUTLINE.txt for how the code works and FINDINGS.txt
+for what we learned about the scraped system.
+
+
+DONE: CONSOLIDATION INTO ONE CLI
+--------------------------------
+The seven standalone scripts and their three config files were consolidated into a
+single `f5kb` CLI with subcommands plus a `lib/` module tree. Everything is now:
+  - one entry point `f5kb.ts` + thin `cmd/*.ts` wrappers + `lib/` (see OUTLINE.txt);
+  - one merged `config.yaml` (types: + field_descriptions: + products:);
+  - 101 offline tests (unit/integration/regression against test/fixtures/, network
+    dependency-injected; opt-in live via F5_LIVE=1).
+Output formats and flag semantics are unchanged (verified: a before/after dump diff
+is byte-identical, and `f5kb track` over the 106k dump reported 0 new / 0 changed).
 
 
 DONE 2026-06-04: FULL-CORPUS DUMP (13 types, all except Community + F5 GitHub)
 ------------------------------------------------------------------------------
-106,042 articles. dump_articles.ts --all -> enrich_bodies.ts -> track_articles.ts.
-All 13 types' on-disk counts == live Coveo counts (verified). Body coverage:
+106,042 articles. f5kb dump --all -> f5kb enrich -> f5kb track. All 13 types'
+on-disk counts == live Coveo counts (verified). Body coverage:
 Bug_Tracker/Release_Note/Supplemental 100%, Manual 99% (the ~239 no-body cases are
 all legitimate: soft-404 dead links, moved-to-landing redirects, image-only/empty
 stub pages, 1 KB cross-reference). Tracking DB: outputs/articles.db.
 
 To REFRESH later (incremental change tracking): re-run the same 3-step pipeline;
-track_articles.ts will report new/changed/removed vs the prior run. Counts drift
-on the live corpus, so re-run any type whose dump shows a shortfall.
+`f5kb track` will report new/changed/removed vs the prior run, and `f5kb status`
+gives a health summary. Counts drift on the live corpus, so re-run any type whose
+dump shows a shortfall.
+
+    deno task dump --all --out=outputs/dump --types="..."
+    deno task enrich --dump=outputs/dump
+    deno task track --dump=outputs/dump
+    deno task status
 
 The driven run found+fixed several real bugs (all committed) — see FINDINGS.txt
 and `git log`: fetch timeout (no-hang), @rowid keyset (offset cap + dense @date
@@ -97,10 +115,10 @@ FUTURE IDEA (NOT now): SKIP UNCHANGED BODIES TO CUT API/SCRAPE CALLS
 -------------------------------------------------------------------
 Use the tracking DB to avoid re-pulling expensive bodies. On a later dump, if an
 article's dates and metadata_hash are unchanged from the previous run (i.e. the
-record didn't change), skip re-fetching/re-scraping its body in enrich_bodies.ts
-and carry the existing content forward. Requires:
-  - track_articles.ts already stores metadata_hash + the dates (done).
-  - enrich_bodies.ts would consult the DB per article and short-circuit when the
+record didn't change), skip re-fetching/re-scraping its body in `f5kb enrich` and
+carry the existing content forward. Requires:
+  - `f5kb track` already stores metadata_hash + the dates (done).
+  - `f5kb enrich` would consult the DB per article and short-circuit when the
     metadata_hash matches and a content_hash already exists.
   - Decide cadence: run track BEFORE enrich (to know what changed), or have a
     combined orchestration step.
@@ -114,8 +132,8 @@ Release Note, Supplemental Document) — see FINDINGS.txt "Body recovery" and
 README.txt. No headless browser needed (docs.cloud.f5.com bodies come from the
 page's embedded __NEXT_DATA__ JSON).
 
-Script hardening (2026-06-03): dump_articles.ts gained --all (full corpus),
-guest-token refresh on 401/419, per-type error isolation, written-vs-server
-count validation, and a richer _index.json + non-zero exit on failures.
-enrich_bodies.ts gained --refetch-errors and writes _enrich_report.json.
-Added track_articles.ts (embedded SQLite master overview).
+Pipeline hardening (2026-06-03): the dump path gained --all (full corpus),
+guest-token refresh on 401/419, per-type error isolation, written-vs-server count
+validation, and a richer _index.json + non-zero exit on failures. The enrich path
+gained --refetch-errors and writes _enrich_report.json. Added the SQLite master
+overview (now `f5kb track`). All of this now lives under `f5kb` + `lib/`.

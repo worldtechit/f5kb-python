@@ -16,7 +16,7 @@
     "status": "deno run --allow-read f5kb.ts status",
     "discover": "deno run --allow-net --allow-read --allow-write f5kb.ts discover",
     "check": "deno check f5kb.ts cmd/*.ts lib/**/*.ts",
-    "test": "deno test --allow-read",
+    "test": "deno test --allow-read --allow-write --allow-env",
     "test:live": "F5_LIVE=1 deno test --allow-net --allow-read --allow-env",
     "fmt": "deno fmt",
     "lint": "deno lint"
