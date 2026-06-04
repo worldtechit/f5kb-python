@@ -282,9 +282,59 @@ The portal exposes sitemaps at:
     https://my.f5.com/manage/s/sitemap-view-1.xml           (5 URLs)
 
 Each entry contains `<loc>` (article URL) and `<lastmod>` only — no title,
-summary, or content type. The sitemap covers **all** article types/products
-with no filtering capability. Fetching metadata would require a separate HTTP
-request per article. Use the Coveo API instead.
+summary, or content type. No auth needed; plain `curl` works.
+
+**How to check it / follow the references:**
+
+    # 1. index -> list child sitemaps
+    curl -s https://my.f5.com/manage/s/sitemap.xml | grep -oE '<loc>[^<]+</loc>'
+    # 2. fetch each child, extract all article URLs
+    for s in sitemap-topicarticle-1 sitemap-topicarticle-2 \
+             sitemap-topicarticle-weekly sitemap-view-1; do
+      curl -s "https://my.f5.com/manage/s/$s.xml"
+    done | grep -oE '<loc>[^<]+</loc>' | sed 's/<[^>]*>//g'
+    # 3. reduce to K-IDs
+    ... | grep -oE '/article/(K?[0-9]+)' | sed 's#/article/##' | sort -u
+    # lastmod pairs (loc immediately followed by lastmod):
+    #   <loc>…/article/<id></loc><lastmod>YYYY-MM-DDThh:mm:ssZ</lastmod>
+
+**Scope (verified 2026-06-03):** ~35,424 URLs, **all** of the form `/article/K…`
+(Salesforce-Knowledge articles only) plus 5 nav stubs. The sitemap does NOT list
+Bug Tracker (cdn.f5.com), Manual / Release Note / Supplemental Document (TechComm
+doc sites), F5 GitHub, Community, or Education (Zendesk) — those live on other
+hosts. So it overlaps only the 8 SF-Knowledge types and omits ~71k of our corpus;
+it is **not** a broader or richer source than the Coveo dump.
+
+### Sitemap-vs-dump gap analysis (2026-06-03)
+
+Diffed the sitemap's distinct K-IDs against our dump's K-articles (filenames):
+
+| | count |
+|---|-------|
+| Distinct K-IDs in sitemap                | 35,337 |
+| K-articles in our dump                   | 35,576 |
+| In sitemap **not** in dump (the gap)     | **47** |
+| In dump **not** in sitemap (we're ahead) | 286    |
+
+**The 47 gap articles are all absent from the Coveo index itself** (confirmed by
+`@f5_kb_id=="K…"` and free-text queries returning nothing), so they are not
+retrievable by the Coveo-based pipeline — not a dump bug. By `lastmod`: only **2**
+are recent (≥2026-05, plausible Coveo indexing lag); the other **45** are old
+(2023–early 2026, incl. the 2024-09 migration) — migrated into Salesforce but never
+(re)indexed by Coveo (likely superseded/unpublished/merged). Their pages return
+HTTP 200 but only as the my.f5.com Salesforce SPA shell, so the only way to get them
+is scraping that JS SPA per-article (deliberately avoided; low value). The 47 IDs
+are saved in `sitemap_gap_ids.txt`.
+
+**The 286 "extras"** are articles we have that the sitemap omits — **252 are Security
+Advisories** (+14 Known Issue, 13 Support Solution, 7 Knowledge); the sitemap
+under-lists Security Advisories, so our Coveo dump is the more complete source there.
+
+**Bottom line:** the only true gap the sitemap reveals is ~45 old Coveo-unindexed
+K-articles (practically unreachable, low value) plus a couple of indexing-lag items.
+The sitemap's real utility is exactly that: surfacing the handful of Salesforce
+articles missing from Coveo, and a cheap `lastmod` feed for change-polling. Use the
+Coveo API for everything else.
 
 ---
 

@@ -20,6 +20,23 @@ hosts, plain-text changelog fallback, Bug Tracker CVE template, soft-404 + landi
 redirect + F5-KB-redirect handling, guest-token refresh, per-type error isolation.
 
 
+FOLLOW-UP: sitemap gap (47 Coveo-unindexed K-articles)
+------------------------------------------------------
+The my.f5.com sitemap lists 47 K-article IDs that are absent from the Coveo index
+(so the pipeline can't reach them) — see findings.md "Sitemap" section and the
+saved list `sitemap_gap_ids.txt`. ~2 are recent (likely indexing lag → re-check
+on a future dump; if they appear in Coveo, no action). The other ~45 are old
+(2023–early 2026) and only reachable by scraping the my.f5.com Salesforce SPA
+per-article. TODO:
+  - Periodically re-derive the gap (re-run the sitemap diff) and confirm the
+    recent ones get picked up by Coveo over time.
+  - DECIDE whether the ~45 old ones are worth a per-article my.f5.com SPA scrape
+    (likely superseded/unpublished; low value). If yes, build a small targeted
+    scraper (parse the article page's embedded data, not headless) for just these.
+  - Also re-check whether the sitemap's Security-Advisory under-listing matters
+    for any external cross-checks (our dump has 252 SAs the sitemap omits).
+
+
 FUTURE IDEA (NOT now): skip unchanged bodies to cut API/scrape calls
 --------------------------------------------------------------------
 Use the tracking DB to avoid re-pulling expensive bodies. On a later dump, if an

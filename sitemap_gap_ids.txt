@@ -1,0 +1,65 @@
+F5 SITEMAP GAP — article IDs in the my.f5.com sitemap but ABSENT from our dump
+====================================================================================
+Generated 2026-06-03. See findings.md 'Sitemap' section for the
+fetch method and full analysis. Re-derive by diffing sitemap K-IDs vs outputs/dump.
+
+47 K-article IDs are listed in the sitemap but are NOT in outputs/dump, AND are
+absent from the Coveo search index itself (verified via @f5_kb_id and free-text queries),
+so they are NOT retrievable by the Coveo-based pipeline.
+  - 2 have a recent lastmod (>=2026-05) -> possibly Coveo indexing lag (may appear later).
+  - the other 45 are old (2023-early 2026): migrated to Salesforce but never
+    (re)indexed by Coveo (likely superseded/unpublished/merged). The page URL returns 200
+    but only as the my.f5.com Salesforce SPA shell; reachable only by scraping that SPA
+    per-article (deliberately avoided; low value).
+
+lastmod by year: 2023:15, 2024:16, 2025:7, 2026:9
+
+id            lastmod
+----------------------------------------
+K000130602    2023-03-02T17:37:47.000Z
+K000132222    2023-03-02T17:37:47.000Z
+K000092630    2023-03-20T15:54:17.000Z
+K000091342    2023-03-20T15:56:12.000Z
+K000133545    2023-04-17T23:07:57.000Z
+K000133617    2023-04-21T23:10:04.000Z
+K000133767    2023-05-03T13:49:01.000Z
+K000133455    2023-06-20T19:03:32.000Z
+K000135570    2023-07-22T00:45:54.000Z
+K000135481    2023-07-27T18:33:49.000Z
+K000135713    2023-08-04T19:13:53.000Z
+K000135540    2023-10-10T14:54:52.000Z
+K000137165    2023-10-26T19:24:17.000Z
+K000137438    2023-11-03T17:50:54.000Z
+K000137983    2023-12-20T20:08:25.000Z
+K000138204    2024-01-16T20:11:32.000Z
+K000138116    2024-01-29T20:24:57.000Z
+K000138580    2024-02-14T14:58:52.000Z
+K000138860    2024-03-08T16:18:36.000Z
+K000138939    2024-03-19T12:00:00.000Z
+K000139023    2024-03-27T12:01:00.000Z
+K000139671    2024-05-29T13:54:58.000Z
+K000139855    2024-06-04T18:55:29.000Z
+K000137213    2024-07-12T23:02:05.000Z
+K000140692    2024-08-14T13:48:48.000Z
+K000140750    2024-09-03T19:00:59.000Z
+K000141072    2024-09-17T08:01:00.000Z
+K000141424    2024-10-16T13:47:52.000Z
+K000148237    2024-10-24T00:32:26.000Z
+K000148468    2024-11-11T23:40:05.000Z
+K000148834    2024-12-03T21:18:00.000Z
+K000149522    2025-01-28T21:44:29.000Z
+K000149624    2025-02-05T14:55:37.000Z
+K000151148    2025-05-07T13:52:49.000Z
+K000151676    2025-06-03T22:59:15.000Z
+K000152918    2025-08-13T14:01:01.000Z
+K000156974    2025-10-09T21:07:35.000Z
+K000157017    2025-10-17T19:16:07.000Z
+K000159585    2026-01-20T17:57:18.000Z
+K000159835    2026-02-04T14:49:00.000Z
+K000159836    2026-02-06T15:13:29.000Z
+K000159943    2026-02-09T17:02:07.000Z
+K000160047    2026-02-18T14:55:02.000Z
+K000160425    2026-03-24T14:03:31.000Z
+K000160490    2026-03-27T17:52:35.000Z
+K000161231    2026-05-13T13:58:46.000Z
+K000161322    2026-05-22T13:55:54.000Z

@@ -55,6 +55,8 @@ DOCUMENTATION MAP
   TODO.txt       Open work.
   available_fields.txt  Field-name -> description reference (feeds the catalogue).
   sitemap_note.txt      Notes on the my.f5.com sitemap (alternative discovery path).
+  sitemap_gap_ids.txt   The 47 K-article IDs in the sitemap but absent from Coveo
+                        (see findings.md "Sitemap" for method + analysis).
 
 OUTPUT LOCATIONS
 ----------------
