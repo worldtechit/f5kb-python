@@ -547,6 +547,10 @@ const HOST_RULES: Record<string, HostRule> = {
   "clouddocs.f5.com": { selectors: ["[role=main]", "article.docs-container"] },
   "techdocs.f5.com": { selectors: ["div.pageContent", "div.manual-chapter", "main"] },
   "docs.nginx.com": { selectors: ["[data-testid=content]", "main.content", "article"] },
+  // nginx.org (open-source NGINX docs) and unit.nginx.org (NGINX Unit, Sphinx)
+  // both keep the body in #content.
+  "nginx.org": { selectors: ["#content", "#main"] },
+  "unit.nginx.org": { selectors: ["#content", "div.body", "#main"] },
   // docs.cloud.f5.com (Next.js) renders the article body client-side, so it is
   // NOT in the rendered DOM of an API page. But the body IS embedded in the
   // page's <script id="__NEXT_DATA__"> JSON (docData.compiledSource for prose
