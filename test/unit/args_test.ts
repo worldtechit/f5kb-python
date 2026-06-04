@@ -58,6 +58,9 @@ Deno.test("logLevelFromFlags: precedence + json-logs", () => {
   assertEquals(logLevelFromFlags(parseFlags(["--verbose"]).flags).level, "debug");
   assertEquals(logLevelFromFlags(parseFlags(["--debug"]).flags).level, "trace");
   // debug overrides verbose/quiet (applied last).
-  assertEquals(logLevelFromFlags(parseFlags(["--quiet", "--verbose", "--debug"]).flags).level, "trace");
+  assertEquals(
+    logLevelFromFlags(parseFlags(["--quiet", "--verbose", "--debug"]).flags).level,
+    "trace",
+  );
   assertEquals(logLevelFromFlags(parseFlags(["--json-logs"]).flags).json, true);
 });

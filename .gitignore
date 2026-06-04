@@ -17,3 +17,6 @@ last_week/
 # Scratch / temp
 *.tmp
 /tmp/
+
+# discover side-file (copy its products: block into config.yaml)
+discovered_products.yaml

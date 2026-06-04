@@ -49,7 +49,24 @@ async function seed(opts: { withError?: boolean } = {}) {
       body_error,first_seen_run,last_seen_run,last_changed_run)
      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
   );
-  ins.run("Knowledge", "K1", "t1", "l1", null, null, null, null, nowIso, "m1", "c1", 1, null, "R1", "R1", "R1");
+  ins.run(
+    "Knowledge",
+    "K1",
+    "t1",
+    "l1",
+    null,
+    null,
+    null,
+    null,
+    nowIso,
+    "m1",
+    "c1",
+    1,
+    null,
+    "R1",
+    "R1",
+    "R1",
+  );
   ins.run(
     "Knowledge",
     "K2",

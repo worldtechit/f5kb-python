@@ -14,10 +14,10 @@
 
 import { assertEquals } from "@std/assert";
 import {
+  type Article,
   canonical,
   contentForHash,
   hasBody,
-  type Article,
   type Record_,
   sha256,
   toRecord,
