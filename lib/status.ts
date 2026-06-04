@@ -190,6 +190,9 @@ export async function computeStatus(
   let lastRun: LastRun | null = null;
   let newestCapturedAt: string | null = null;
   const errorClasses: ErrorClass[] = [];
+  // Authoritative per-document-type bodied/error counts from the DB (the enrich
+  // report only covers the last run's types, so it is an unreliable per-type source).
+  const dbByType = new Map<string, { bodied: number; errors: number }>();
   const dbPresent = await exists(dbPath);
   if (dbPresent) {
     let db: DatabaseSync | null = null;
@@ -242,6 +245,16 @@ export async function computeStatus(
         "SELECT MAX(captured_at) AS m FROM articles",
       ).get() as { m: string } | undefined;
       newestCapturedAt = cap?.m ?? null;
+
+      const grpRows = db.prepare(
+        "SELECT document_type AS dt, " +
+          "SUM(CASE WHEN has_body=1 THEN 1 ELSE 0 END) AS bodied, " +
+          "SUM(CASE WHEN body_error IS NOT NULL AND body_error != '' THEN 1 ELSE 0 END) AS errors " +
+          "FROM articles GROUP BY document_type",
+      ).all() as Array<{ dt: string; bodied: number; errors: number }>;
+      for (const r of grpRows) {
+        dbByType.set(String(r.dt), { bodied: Number(r.bodied), errors: Number(r.errors) });
+      }
     } catch (e) {
       notes.push(`could not read DB ${dbPath}: ${(e as Error).message}`);
     } finally {
@@ -251,6 +264,16 @@ export async function computeStatus(
     }
   } else {
     notes.push(`DB ${dbPath} missing`);
+  }
+
+  // Prefer DB-derived per-type bodied/error counts (complete); the dir name maps to
+  // the document_type by turning underscores back into spaces.
+  for (const t of perType) {
+    const d = dbByType.get(t.typeKey.replaceAll("_", " "));
+    if (d) {
+      t.bodied = d.bodied;
+      t.errors = d.errors;
+    }
   }
 
   // --- staleness + health ---

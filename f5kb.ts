@@ -22,47 +22,72 @@ type CmdRunner = (
 
 interface CmdDef {
   desc: string;
+  /** Flag synopsis shown by `f5kb <sub> --help`. */
+  flags: string;
   load: () => Promise<{ run: CmdRunner }>;
 }
 
 const COMMANDS: Record<string, CmdDef> = {
   dump: {
     desc: "Dump full metadata + content per article, one JSON per type.",
+    flags:
+      "(--days=N | --all)  --out=DIR  [--config=config.yaml] [--types=A,B] [--page-size=200] [--limit=N] [--fields-doc=FILE(deprecated)]",
     load: () => import("./cmd/dump.ts"),
   },
   enrich: {
     desc: "Fetch article bodies for types the search index leaves empty.",
+    flags:
+      "[--dump=outputs/dump] [--types=A,B] [--concurrency=4] [--delay-ms=200] [--limit=N] [--refetch] [--refetch-errors]   (env: GITHUB_TOKEN)",
     load: () => import("./cmd/enrich.ts"),
   },
   track: {
     desc: "Index a dump into the SQLite overview; report new/changed/removed.",
+    flags: "[--dump=outputs/dump] [--db=FILE] [--types=A,B] [--run-id=ID] [--json]",
     load: () => import("./cmd/track.ts"),
   },
   status: {
     desc: "Read-only health report for a dump + its tracking DB.",
+    flags: "[--dump=outputs/dump] [--db=FILE] [--json]",
     load: () => import("./cmd/status.ts"),
   },
   fetch: {
     desc: "Fetch articles by product/type into a flat JSON (+ optional CSV).",
+    flags:
+      "[--product=NAME] [--type=NAME] [--limit=N] [--output=FILE] [--csv=FILE] [--page-size=100]",
     load: () => import("./cmd/fetch.ts"),
   },
   recent: {
     desc: "Fetch articles modified in the last N days, one JSON per type.",
+    flags: "--days=N  --out=DIR  [--types=A,B] [--page-size=500] [--limit=N]",
     load: () => import("./cmd/recent.ts"),
   },
   "list-types": {
     desc: "Print all document types with counts.",
+    flags: "(no flags)",
     load: () => import("./cmd/list_types.ts"),
   },
   "list-products": {
     desc: "Print products known to the global facet, with counts.",
+    flags: "(no flags)",
     load: () => import("./cmd/list_products.ts"),
   },
   discover: {
     desc: "Deep product discovery; write discovered_products.yaml.",
+    flags: "[--out=discovered_products.yaml] [--format=yaml|json]",
     load: () => import("./cmd/discover.ts"),
   },
 };
+
+function subUsage(sub: string, def: CmdDef): void {
+  const lines = [
+    `f5kb ${sub} — ${def.desc}`,
+    "",
+    `Usage: f5kb ${sub} ${def.flags}`,
+    "",
+    "Plus global flags: --verbose / --debug / --quiet / --json-logs.",
+  ];
+  Deno.stderr.writeSync(new TextEncoder().encode(lines.join("\n") + "\n"));
+}
 
 function usage(): void {
   const lines = [
@@ -118,10 +143,9 @@ async function main(): Promise<number> {
   // Parse the remaining args (everything after the subcommand).
   const parsed = parseFlags(argv.slice(1));
 
-  // Subcommand help: print usage and exit 0 (the cmd modules document their own
-  // flags in comments; here we just point back to the top-level usage).
+  // `f5kb <sub> --help` prints that subcommand's flag synopsis.
   if ("help" in parsed.flags || "h" in parsed.flags) {
-    usage();
+    subUsage(sub, def);
     return 0;
   }
 
