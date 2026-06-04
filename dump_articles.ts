@@ -468,14 +468,18 @@ async function fetchTypeSince(
   applyModFilter = true,
 ): Promise<CoveoResult[]> {
   const baseAq = `@f5_document_type=="${documentType}"`;
+  // --all (applyModFilter=false): page the ENTIRE type by @rowid keyset, with no
+  // @date window. @rowid is on every document, so this captures articles whose
+  // @date is null or outside any date window (date-range queries silently drop
+  // those) and has no 5,000-offset cap or dense-second blind spot. This is the
+  // robust full-corpus path; fetchKeyset dedups by permanentid.
+  if (!applyModFilter) {
+    return await fetchKeyset(config, baseAq, pageSize, limit, onProgress);
+  }
+  // --days: date-window the @date superset, then refine to the exact content-mod
+  // window (the @date re-index date is always >= the content modification date).
   const collected: CoveoResult[] = [];
   await fetchChunked(config, baseAq, cutoffMs, endMs, pageSize, limit, onProgress, collected);
-  // @date (re-index date) is always >= the content modification date, so the
-  // server-side window is a superset. For a --days window we refine it to the
-  // exact content-mod window here. For --all there is no lower bound to enforce,
-  // and an article with a genuine pre-2000 (or missing/epoch) mod date would be
-  // wrongly dropped — so skip the filter entirely.
-  if (!applyModFilter) return collected;
   return collected.filter((r) => {
     const m = modMsOf(r.raw as CoveoResult);
     return m === undefined || m >= cutoffMs;
@@ -766,8 +770,12 @@ for (const typeKey of typeKeys) {
   const st: TypeStatus = { typeKey, documentType: cfg.documentType, dir, status: "ok", expected: null, fetched: 0, written: 0, writeErrors: 0 };
   try {
     // Server-side count over the window — the target to validate against.
-    const windowAq = `@f5_document_type=="${cfg.documentType}" ${dateAq(cutoffMs, endMs)}`.trim();
-    st.expected = await getCount(config, windowAq);
+    // Validate against the bare type count under --all (we fetch the whole type
+    // by keyset); under --days, against the @date-windowed count.
+    const expectAq = allTime
+      ? `@f5_document_type=="${cfg.documentType}"`
+      : `@f5_document_type=="${cfg.documentType}" ${dateAq(cutoffMs, endMs)}`.trim();
+    st.expected = await getCount(config, expectAq);
 
     const results = await fetchTypeSince(config, cfg.documentType, cutoffMs, endMs, pageSize, limit, () => {}, !allTime);
     st.fetched = results.length;
