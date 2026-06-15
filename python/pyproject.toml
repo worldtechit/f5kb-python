@@ -22,8 +22,8 @@ testpaths = ["tests"]
 addopts = "-ra -q"
 markers = ["live: requires network access"]
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "pytest>=8.0",
     "pytest-mock>=3.12",
 ]
