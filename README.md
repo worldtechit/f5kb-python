@@ -64,6 +64,14 @@ uv run pytest -m live             # live/network tests (require my.f5.com access
 No network required for the default suite — all tests use injected httpx transports
 and local fixtures.
 
+Lint, format, and type-check:
+
+```
+uv run ruff check .       # lint
+uv run ruff format .      # format (config.yaml is excluded — hand-edit only)
+uv run mypy f5kb/         # type-check
+```
+
 ## Selecting types (`--types` / `--exclude-types`)
 
 Every type-aware subcommand (`dump`, `enrich`, `track`, `sync`, `reconcile`, `approve`,
