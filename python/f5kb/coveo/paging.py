@@ -194,10 +194,14 @@ def fetch_type_since(
     apply_mod_filter: bool = True,
 ) -> list[CoveoResult]:
     base_aq = f'@f5_document_type=="{document_type}"'
+    # limit=0 means "no cap"; normalize before passing to paging helpers
+    max_r: int | float = float("inf") if limit == 0 else limit
     if not apply_mod_filter:
-        return fetch_keyset(client, base_aq, page_size, limit, on_progress)
+        return fetch_keyset(client, base_aq, page_size, max_r, on_progress)
     collected: list[CoveoResult] = []
-    fetch_chunked(client, base_aq, cutoff_ms, end_ms, page_size, limit, on_progress, collected)
+    # fetch_chunked takes int; use large sentinel for unlimited
+    chunked_max = int(max_r) if max_r != float("inf") else 10_000_000
+    fetch_chunked(client, base_aq, cutoff_ms, end_ms, page_size, chunked_max, on_progress, collected)
     return [
         r for r in collected
         if (m := mod_ms_of(r.get("raw"))) is None or m >= cutoff_ms
