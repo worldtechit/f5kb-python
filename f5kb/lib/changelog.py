@@ -6,9 +6,10 @@ operation makes to the dump or DB. Records buffered and flushed as JSONL
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
 from typing import Literal
+
+from f5kb.lib.fsutil import iso_now
 
 ChangeOp = Literal[
     "added",
@@ -54,7 +55,7 @@ class Changelog:
             return
         entry: dict = {
             "runId": self._run_id,
-            "ts": _iso_now(),
+            "ts": iso_now(),
             "op": op,
             "documentType": document_type,
             "id": id,
@@ -80,5 +81,3 @@ class Changelog:
         self._buf.clear()
 
 
-def _iso_now() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z"

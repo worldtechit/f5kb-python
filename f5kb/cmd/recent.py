@@ -22,7 +22,7 @@ from f5kb.lib.dump import dump_types
 @click.option("--limit", type=int, default=0)
 @click.option("--config", "config_path", default="config.yaml", show_default=True)
 @click.pass_context
-def recent_cmd(ctx, days, out, types, exclude_types, page_size, limit, config_path):
+def recent_cmd(ctx, days, out, types, exclude_types, page_size, limit, config_path) -> None:
     """Fetch articles modified in the last N days, one JSON per type."""
     log = ctx.obj["logger"]
     try:

@@ -20,7 +20,7 @@ from f5kb.track.db import track_dump
 @click.option("--changelog", "changelog_flag", default=None, is_flag=False, flag_value="")
 @click.option("--json", "as_json", is_flag=True)
 @click.pass_context
-def track_cmd(ctx, dump_dir, db, types, exclude_types, run_id, changelog_flag, as_json):
+def track_cmd(ctx, dump_dir, db, types, exclude_types, run_id, changelog_flag, as_json) -> None:
     """Index a dump into the SQLite overview; report new/changed/removed."""
     from f5kb.lib.logger import make_logger
     log = ctx.obj["logger"]

@@ -12,7 +12,7 @@ from f5kb.lib.status import compute_status, render_status
 @click.option("--db", default=None)
 @click.option("--json", "as_json", is_flag=True)
 @click.pass_context
-def status_cmd(ctx, dump_dir, db, as_json):
+def status_cmd(ctx, dump_dir, db, as_json) -> None:
     """Read-only health report for a dump + its tracking DB."""
     report = compute_status(dump_dir, db=db)
     if as_json:

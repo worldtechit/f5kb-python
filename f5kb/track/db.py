@@ -7,13 +7,12 @@ existing outputs/articles.db remains valid across runs.
 from __future__ import annotations
 
 import sqlite3
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from f5kb.lib.logger import Logger, NULL_LOGGER
-from f5kb.lib.fsutil import list_type_dirs, path_exists, read_json, walk_article_files
+from f5kb.lib.fsutil import iso_now, list_type_dirs, path_exists, read_json, walk_article_files
 from f5kb.track.hashing import Record_, to_record
 
 
@@ -182,10 +181,6 @@ class TrackSummary:
     per_type: dict[str, PerTypeStat] = field(default_factory=dict)
 
 
-def _iso_now() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
 def track_dump(
     dump: str,
     db_path: str | None = None,
@@ -198,7 +193,7 @@ def track_dump(
     log = logger
     dump_path = str(dump).rstrip("/")
     db_file = db_path or str(Path(dump_path).parent / "articles.db")
-    run = run_id or _iso_now()
+    run = run_id or iso_now()
     exclude = set(exclude_types or [])
 
     try:
@@ -293,7 +288,7 @@ def track_dump(
 
         conn.execute(
             "INSERT OR REPLACE INTO runs (run_id,ran_at,dump_dir,types,scanned,new,changed,unchanged,removed) VALUES (?,?,?,?,?,?,?,?,?)",
-            (run, _iso_now(), dump_path, ",".join(type_keys), scanned, n_new, n_changed, n_unchanged, removed),
+            (run, iso_now(), dump_path, ",".join(type_keys), scanned, n_new, n_changed, n_unchanged, removed),
         )
 
     conn.close()

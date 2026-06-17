@@ -75,7 +75,7 @@ def github_api(
     headers = github_headers(token, json=True)
 
     if http is not None:
-        res = http._client.get(url, headers=headers)
+        res = http.get(url, headers=headers)
     else:
         res = httpx.get(url, headers=headers, timeout=60.0)
 

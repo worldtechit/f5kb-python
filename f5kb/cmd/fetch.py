@@ -24,7 +24,7 @@ EPOCH_END_MS = 1893456000000   # 2030-01-01
 @click.option("--csv", "csv_file", default=None)
 @click.option("--page-size", type=int, default=100, show_default=True)
 @click.pass_context
-def fetch_cmd(ctx, product, doc_type, limit, output, csv_file, page_size):
+def fetch_cmd(ctx, product, doc_type, limit, output, csv_file, page_size) -> None:
     """Fetch articles by product/type into a flat JSON (+ optional CSV)."""
     log = ctx.obj["logger"]
     page_size = min(page_size, 1000)

@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import json
-import os
 import re
+import time
 from pathlib import Path
 from typing import Generator
 
@@ -57,3 +57,8 @@ def list_type_dirs(dump_dir: str | Path) -> list[str]:
 
 def path_exists(path: str | Path) -> bool:
     return Path(path).exists()
+
+
+def iso_now() -> str:
+    """Current UTC time as ISO 8601 string: 2024-01-15T12:34:56Z"""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())

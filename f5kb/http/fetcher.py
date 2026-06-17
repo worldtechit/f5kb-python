@@ -55,6 +55,10 @@ class HttpClient:
                 return self.fetch_text(url, attempt + 1)
             raise
 
+    def get(self, url: str, *, headers: dict[str, str]) -> httpx.Response:
+        """Low-level GET with caller-supplied headers. No retry or UA injection."""
+        return self._client.get(url, headers=headers)
+
     def fetch_doc(self, url: str, attempt: int = 0) -> tuple[str, str]:
         """GET url following redirects. Returns (html, final_url)."""
         headers = {"User-Agent": self._user_agent, "Accept": "text/html"}

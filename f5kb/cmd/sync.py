@@ -39,7 +39,7 @@ from f5kb.lib.sync import sync_dump
 @click.pass_context
 def sync_cmd(ctx, all_time, days_str, since_last_run, types, exclude_types, out_dir,
              config_path, db, no_enrich, changelog_flag, no_changelog, dry_run, yes,
-             page_size, limit, concurrency, delay_ms):
+             page_size, limit, concurrency, delay_ms) -> None:
     """Incremental update: dump+enrich+track only changed; detect deletions."""
     log = ctx.obj["logger"]
     mode_count = sum([all_time, bool(days_str), since_last_run])

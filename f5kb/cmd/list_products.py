@@ -11,7 +11,7 @@ from f5kb.coveo.client import CoveoClient
 @click.command()
 @click.option("--json", "as_json", is_flag=True)
 @click.pass_context
-def list_products_cmd(ctx, as_json):
+def list_products_cmd(ctx, as_json) -> None:
     """Print products known to the global facet, with counts."""
     log = ctx.obj["logger"]
     log.info("Fetching Coveo configuration from F5 portal...")

@@ -25,7 +25,7 @@ from f5kb.enrich.driver import enrich_dump
 @click.option("--yes", is_flag=True, help="Bypass gate: overwrite existing bodies.")
 @click.pass_context
 def enrich_cmd(ctx, dump_dir, types, exclude_types, concurrency, delay_ms, limit,
-               refetch, refetch_errors, changelog_flag, yes):
+               refetch, refetch_errors, changelog_flag, yes) -> None:
     """Fetch article bodies for types the search index leaves empty."""
     log = ctx.obj["logger"]
     include_types = [t.strip() for t in types.split(",")] if types else None

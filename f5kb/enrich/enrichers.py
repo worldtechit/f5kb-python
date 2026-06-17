@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import re
+import sys
 from typing import Callable, Any
 from urllib.parse import urlparse
 
@@ -72,7 +73,6 @@ def enrich_doc_page(article: dict, now_iso: str, http: HttpClient, **_) -> dict:
             "bodyError": f"JS-rendered host {host}: body not in fetched HTML (needs headless browser)",
         }
     if not rule:
-        import sys
         print(f"  [doc] unmapped host: {host} (using generic fallback) — {url}", file=sys.stderr)
 
     html, final_url = http.fetch_doc(url)

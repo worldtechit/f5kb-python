@@ -31,7 +31,7 @@ from f5kb.track.db import load_hash_index
 @click.option("--yes", is_flag=True, help="Bypass approval gate: overwrite in place.")
 @click.pass_context
 def dump_cmd(ctx, all_time, days, out, config_path, fields_doc, types, exclude_types,
-             page_size, limit, db, changelog_flag, yes):
+             page_size, limit, db, changelog_flag, yes) -> None:
     """Dump full metadata + content for F5 KB articles (one JSON per article)."""
     log = ctx.obj["logger"]
     include_types = [t.strip() for t in types.split(",")] if types else None

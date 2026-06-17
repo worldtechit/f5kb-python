@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from bs4 import BeautifulSoup, NavigableString, Tag
@@ -32,7 +33,7 @@ def parse_bug_content(html: str) -> dict[str, str]:
     return {
         label: value
         for label, value in fields.items()
-        if __import__("re").search(r"CVE|Related Article|Vulnerability Severity", label, __import__("re").I)
+        if re.search(r"CVE|Related Article|Vulnerability Severity", label, re.I)
         and value
     }
 
@@ -64,7 +65,6 @@ def _parse_standard(container: Tag) -> dict[str, str]:
 
 def parse_labeled_fields(root: Tag) -> dict[str, str]:
     """Parse '<span class=standard-field>Label:</span> value …' pairs."""
-    import re
     fields: dict[str, str] = {}
     label: str | None = None
     buf: list[str] = []

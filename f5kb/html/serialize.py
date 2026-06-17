@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Callable
 from urllib.parse import urljoin
 
@@ -10,7 +11,7 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 
 def is_hidden(el: Tag) -> bool:
     style = (el.get("style") or "").replace(" ", "")
-    return bool(__import__("re").search(r"display:none", style, __import__("re").I))
+    return bool(re.search(r"display:none", style, re.I))
 
 
 def resolve_url(href: str, base: str | None = None) -> str:

@@ -28,7 +28,7 @@ from f5kb.track.db import track_dump
 @click.option("--json", "as_json", is_flag=True)
 @click.pass_context
 def approve_cmd(ctx, dump_dir, db, types, exclude_types, ids, list_only, reject,
-                include_risky, no_archive, changelog_flag, no_changelog, as_json):
+                include_risky, no_archive, changelog_flag, no_changelog, as_json) -> None:
     """Review + apply (or reject) overwrites staged in _pending/ by the gate."""
     log = ctx.obj["logger"]
     type_keys = [t.strip() for t in types.split(",")] if types else None

@@ -31,7 +31,7 @@ from f5kb.lib.reconcile import reconcile
 @click.option("--json", "as_json", is_flag=True)
 @click.pass_context
 def reconcile_cmd(ctx, types, exclude_types, dump_dir, config_path, db, apply, purge,
-                  max_delete_pct, max_deletes, changelog_flag, page_size, as_json):
+                  max_delete_pct, max_deletes, changelog_flag, page_size, as_json) -> None:
     """Remove articles deleted upstream (report-only unless --apply)."""
     log = ctx.obj["logger"]
     try:

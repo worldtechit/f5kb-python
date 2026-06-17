@@ -16,7 +16,7 @@ from f5kb.config.loader import load_config
 @click.option("--format", "fmt", default="yaml", type=click.Choice(["yaml", "json"]), show_default=True)
 @click.option("--config", "config_path", default="config.yaml", show_default=True)
 @click.pass_context
-def discover_cmd(ctx, out, fmt, config_path):
+def discover_cmd(ctx, out, fmt, config_path) -> None:
     """Deep product discovery; write discovered_products.yaml."""
     log = ctx.obj["logger"]
     log.info("Fetching Coveo configuration from F5 portal...")
