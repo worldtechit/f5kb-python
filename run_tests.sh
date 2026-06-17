@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run_tests.sh — exercise every f5kb feature and log all output for review.
-# Run from inside python/ directory: bash run_tests.sh
-# Output saved to: /tmp/f5kb_test_run.log
+# Run from repo root: bash run_tests.sh
+# Output saved to: /tmp/f5kb_test_run_<timestamp>.log
 
 set -u
 LOG="/tmp/f5kb_test_run_$(date -u +%Y%m%dT%H%M%SZ).log"
@@ -81,9 +81,16 @@ run "help"          uv run f5kb --help
 # ── §1  test suite ───────────────────────────────────────────────────────────
 
 section "§1  full test suite [offline]"
-run "pytest-all"    uv run pytest tests/ -q
-run "pytest-unit"   uv run pytest tests/unit/ -v
-run "pytest-integ"  uv run pytest tests/integration/ -v
+run "pytest-all"        uv run pytest tests/ -q
+run "pytest-unit"       uv run pytest tests/unit/ -v
+run "pytest-integ"      uv run pytest tests/integration/ -v
+run "pytest-regression" uv run pytest tests/regression/ -v
+if [[ "${RUN_LIVE:-}" == "1" ]]; then
+    run "pytest-live"   uv run pytest -m live -v
+else
+    echo "  SKIPPED pytest-live (set RUN_LIVE=1 to include)" | tee -a "$LOG"
+    SKIPPED=$((SKIPPED + 1))
+fi
 
 # ── §2  track ────────────────────────────────────────────────────────────────
 
