@@ -10,8 +10,8 @@ fetched at runtime — no key, no login required).
 
 ## Requirements
 
-- Python 3.11+ (<https://python.org>)
-- [uv](https://docs.astral.sh/uv/) (recommended) or `pip` for dependency management
+- Python 3.11+
+- [uv](https://docs.astral.sh/uv/) — required for dependency management and running commands
 - Internet access to my.f5.com and f5networksproduction5vkhn00h.org.coveo.com
 - No login or API key required — a guest token is fetched automatically and refreshed
   if it expires mid-run
@@ -20,24 +20,9 @@ fetched at runtime — no key, no login required).
 
 ## Installation
 
-Install [uv](https://docs.astral.sh/uv/) if you don't have it:
-
 ```
-# macOS (Homebrew)
-brew install uv
-
-# macOS / Linux
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Windows (PowerShell)
-powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-```
-
-Then clone and sync:
-
-```
-git clone https://github.com/worldtechit/f5kb-pythonport
-cd f5kb-pythonport
+git clone https://github.com/worldtechit/f5kb-python
+cd f5kb-python
 uv sync
 ```
 
