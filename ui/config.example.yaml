@@ -1,0 +1,34 @@
+# ui/config.example.yaml — copy to ui/config.yaml and fill in placeholders.
+# The real ui/config.yaml is git-ignored (it may carry your account id/bucket).
+#
+# f5kb console — target definitions.
+# Launch:  uv run --group ui python ui/server.py --target staging
+#          uv run --group ui python ui/server.py --target local
+#
+# mode: local  -> reads a tree on disk. Two layouts are auto-detected:
+#                 * S3 mirror (root/ has live/, runs/, ...) e.g. from `aws s3 sync`
+#                 * classic CLI outputs (dump_dir has <Type>/<id>.json + _pending/...)
+# mode: aws    -> reads the S3 bucket + live SQS/CloudWatch/Lambda for that stage.
+#                 Mutations additionally require the server's --allow-writes flag.
+#
+# bucket is derived as f5kb-articles-{account_id}-{stage} unless set explicitly.
+# account_id is resolved at startup via STS when omitted.
+
+targets:
+  local:
+    mode: local
+    root: outputs           # checked first for an S3-mirror layout (live/, runs/)
+    dump_dir: outputs/dump  # CLI-layout fallback
+    db: outputs/articles.db
+
+  staging:
+    mode: aws
+    stage: staging
+    region: us-east-2
+    # bucket: f5kb-articles-<AWS_ACCOUNT_ID>-staging   # optional override
+    # account_id: "<AWS_ACCOUNT_ID>"                    # optional; else via STS
+
+  prod:
+    mode: aws
+    stage: prod
+    region: us-east-2

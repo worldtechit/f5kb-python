@@ -65,6 +65,19 @@ reference-only).
 ---
 
 
+## DONE 2026-07-08: WEB CONSOLE (ui/) — FULL REDESIGN
+
+Rebuilt the dashboard into a full console (FastAPI + no-build ES-module frontend):
+Overview / Runs (live per-type progress, held queue with diff + approve/reject) /
+Review / Corpus (browse + search every type, article view with body/metadata/JSON
+tabs) / History (audit trails) / Operations (DLQs, errors, trigger, backfill,
+restore, raw key browser) / Playbook & Docs (built-in operator playbook
+`ui/playbook.md` + all repo docs rendered in-app). Mutations require
+`--allow-writes`, confirm, follow archive-before-overwrite + hash-index +
+audit-trail protocol, and work on both AWS stages and local trees
+(`readers.py` auto-detects S3-mirror vs CLI `outputs/` layouts). See ui/README.md.
+
+
 ## DONE 2026-06-17: PYTHON PORT MIGRATION
 
 Migrated from Deno/TypeScript to Python 3.11+ / uv. Full history:

@@ -211,6 +211,73 @@ and, for each selected entry, recomputes risk fresh from the actual files
 source="approve". Edits with a risk flag are HELD (left pending) unless
 `--include-risky`. `approve` then runs `track_dump` so the DB matches.
 
+### Cloud: Approve Lambda (handlers/approve.py)
+
+Cloud counterpart to `f5kb approve`. Two invocation modes:
+
+1. **S3 event** on `runs/{date}/track/_done` → automatic approval pass over all
+   pending articles for that run.
+2. **API Gateway POST** `/approve` → Slack Block Kit button callback for held articles.
+
+**Risk routing** (from `MANUAL_FLAGS = {"body-dropped", "body-error"}`):
+
+| Risk flag | Action |
+|---|---|
+| `[]` (none) | Auto-approve → `live/` immediately |
+| `body-shrank-{pct}%` | Auto-approve → `live/`, Slack text notify |
+| `body-dropped` | Hold → Slack buttons (approve / reject) |
+| `body-error` | Hold → Slack buttons (approve / reject) |
+
+**Archive-before-overwrite.** Before any live article is overwritten (auto or
+manual), the current live version is copied to
+`archive/{type_key}/{art_id}/{timestamp}.json`. This is the source for restores.
+The copy is best-effort — a failure to archive never blocks promotion.
+
+**Dependency updates on every approve:**
+- `live/{type_key}/{art_id}.json` — receives the promoted version
+- `hash-index/current.json.gz` — updated with the new metadata hash so the next
+  incremental run skips unchanged articles correctly
+- `changed_ids.jsonl` — appended with `{op, id, type, s3_key, run_date, approved_by}`
+- `decisions.jsonl` — appended with `{id, type, op="approved", actor, ts}`
+
+**Held articles** are written to `lambda/state/{run_date}/approve_held.json`.
+When `remaining` reaches 0 (all decided via Slack), `runs/{date}/approve/_done` is
+written to trigger downstream consumers.
+
+### Cloud: Restore Lambda (handlers/restore.py)
+
+Reverts an article to any previously archived version. Invoked manually:
+
+```
+aws lambda invoke \
+  --function-name f5kb-restore-prod \
+  --payload '{"type_key":"Solution","art_id":"K12345",
+              "archive_key":"archive/Solution/K12345/2026-07-01T02-00-00Z.json",
+              "actor":"devinp"}' \
+  response.json
+```
+
+To list available archived versions for an article:
+
+```
+aws s3 ls s3://<bucket>/archive/<type_key>/<art_id>/
+```
+
+**What restore updates (all four must stay consistent):**
+
+1. `live/{type_key}/{art_id}.json` — overwritten with the archived version
+2. `archive/{type_key}/{art_id}/{ts}.json` — current live is archived first (so
+   the displacement is itself reversible)
+3. `hash-index/current.json.gz` — recomputed from the restored version's metadata;
+   without this update, the next incremental run would see the restored article as
+   "changed" and re-stage the current upstream version, undoing the restore
+4. `changed_ids.jsonl` + `decisions.jsonl` — appended with `op="restored"`,
+   `restored_from`, `displaced_to`, `actor`, `ts` for full audit trail
+
+The restore Lambda **does not** re-run track/enrich. If the restored version differs
+materially from what the DB tracks, run `f5kb track` (local) or manually invoke the
+Track Lambda after restore to re-align the DB.
+
 ### f5kb status (cmd/status.py → lib/status.py)
 
 Read-only. Aggregates `_index.json`, `_enrich_report.json`, on-disk per-type counts,
@@ -374,3 +441,36 @@ React to issues: check `_index.json` (re-run failed/partial types with `--types=
 and `_enrich_report.json` (fix the host rule / parser, then `enrich --refetch-errors`).
 Live corpus counts drift, so re-run any type whose dump shows a shortfall; `f5kb track`
 records the delta as new/changed/removed.
+
+## 11. THE WEB CONSOLE (ui/)
+
+A local FastAPI server + no-build ES-module frontend over everything the
+pipeline produces. Not part of the CLI or the Lambda deployment — a dev-machine
+tool (`uv sync --group ui`, never shipped to Lambda).
+
+```
+ui/
+  server.py     routes only — validation, 403 read-only guard, docs rendering
+  readers.py    the data layer. One Reader interface, three sources:
+                  AwsReader          S3 bucket + SQS/CloudWatch/Lambda/SNS
+                  LocalReader        an S3-mirror tree on disk (live/, runs/, …)
+                  CliOutputsReader   the classic outputs/dump/<Type> layout
+                Mutations (edit/restore) are implemented ONCE on the
+                StorageBackend-backed base class: archive-before-overwrite →
+                write live → refresh hash-index (db_key format!) → append
+                audit/{YYYY-MM}/changed_ids.jsonl + decisions.jsonl.
+  runview.py    composes a run's live status from the per-stage S3 files
+                (orchestrator state, dump/enrich cursors + sentinels,
+                track summary/progress, approve manifests, approve_held.json)
+  playbook.md   operator playbook, rendered in-app (daily loop, held-article
+                review, restore, incident runbook)
+  static/       app.js (hash router/shell) · pages.js (7 pages) · ui.js
+                (components) · api.js · style.css — no build step, no CDN
+```
+
+Design decisions: reads are byte-exact against the keys the handlers write
+(see MEMORIES.md S3 layout); AWS restores go through the Restore Lambda so the
+run-open refusal and SNS handoff stay in one place; local restores/edits reuse
+the same protocol via LocalStorage; the article-list endpoint fetches titles
+only for the visible page (bounded ThreadPool) since S3 List doesn't return
+them; expensive listings sit behind a small TTL cache.

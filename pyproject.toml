@@ -8,6 +8,7 @@ dependencies = [
     "beautifulsoup4>=4.12",
     "lxml>=5.0",
     "pyyaml>=6.0",
+    "boto3>=1.34",
 ]
 
 [project.scripts]
@@ -29,7 +30,19 @@ dev = [
     "ruff>=0.4",
     "mypy>=1.0",
     "types-PyYAML>=6.0",
+    "moto[s3,sqs]>=5.0",
+    "types-boto3-s3>=1.34",
 ]
+# Local dashboard only (ui/server.py). Never shipped to Lambda.
+ui = [
+    "fastapi>=0.110",
+    "markdown>=3.10.2",
+    "uvicorn>=0.29",
+]
+
+[[tool.mypy.overrides]]
+module = ["boto3", "boto3.*", "botocore", "botocore.*"]
+ignore_missing_imports = true
 
 [tool.ruff]
 exclude = ["config.yaml"]

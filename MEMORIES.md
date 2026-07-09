@@ -123,6 +123,105 @@ outputs/
 After unzip on a new machine the data is present but untracked by git (expected).
 To rebuild from scratch: delete `outputs/` and run the build pipeline.
 
+## Cloud (S3) data layout
+
+Everything in the S3 bucket `f5kb-articles-{accountId}-prod`:
+
+```
+live/<type_key>/<id>.json          current approved article (metadata + content)
+pending/<type_key>/<id>.json       staged edit awaiting Slack approval
+archive/<type_key>/<id>/<ts>.json  every version replaced before overwrite (90-day lifecycle TBD)
+hash-index/current.json.gz         gzip-compressed JSON: {"<doc_type> <id>": metadata_hash}
+                                   — used by incremental runs to skip unchanged articles
+changed_ids.jsonl                  append-only changelog: every approved/restored change
+decisions.jsonl                    append-only audit trail: every approve/reject/restore decision
+runs/<date>/
+  manifest.jsonl                   articles staged in this run (pending entries)
+  dump/<type>/_done                sentinel: dump complete for this type
+  enrich/_done                     sentinel: all enrichable types complete
+  track/_done                      sentinel: track phase complete
+  track/changes.jsonl              per-article risk + diff output from Track Lambda
+  approve/_done                    sentinel: all articles decided (pipeline end)
+lambda/state/<date>/
+  approve_held.json                held-article state for the Slack callback loop
+```
+
+**`changed_ids.jsonl` schema** — one JSON object per line:
+```json
+{"op":"changed","id":"K12345","type":"Solution","s3_key":"live/Solution/K12345.json",
+ "run_date":"2026-07-02","approved_by":"auto","changed":["content"]}
+{"op":"restored","id":"K12345","type":"Solution","s3_key":"live/Solution/K12345.json",
+ "restored_from":"archive/Solution/K12345/2026-07-01T02-00-00Z.json",
+ "displaced_to":"archive/Solution/K12345/2026-07-02T14-30-00Z.json",
+ "approved_by":"devinp","ts":"2026-07-02T14:30:00Z"}
+```
+
+`op` values: `new` | `changed` | `restored`. `rejected` decisions go to `decisions.jsonl` only (no `changed_ids` entry — rejected articles never enter live/).
+
+## The console (ui/)
+
+`uv run --group ui python ui/server.py --target staging|prod|local` → a local
+web console (127.0.0.1:8000) over the whole pipeline: runs with live progress,
+held-article review with diffs, corpus browsing/search, per-article version
+history, audit-trail views, DLQ/error health, and — with `--allow-writes` —
+approve/reject, trigger runs, restore, direct article edit (archive-first +
+hash-index + audit protocol), and P2 backfill. The operator playbook lives at
+`ui/playbook.md` and renders in-app under Playbook & Docs. Local targets
+auto-detect an S3-mirror tree vs the classic CLI `outputs/` layout. See
+ui/README.md for the full feature map.
+
+## Changelog and restore process
+
+### Changelog
+
+The canonical change record is **`changed_ids.jsonl`** in the bucket root. Every
+article that enters `live/` gets one entry. Fields always present: `op`, `id`,
+`type`, `s3_key`, `approved_by`, `ts`. Additional fields by op:
+
+- `new`/`changed`: `run_date`, `changed` (list of `metadata`/`content`)
+- `restored`: `restored_from` (archive key used), `displaced_to` (where the
+  pre-restore live version was archived)
+
+`decisions.jsonl` is the complementary audit trail — records every decision
+including rejects (which never touch `changed_ids.jsonl`).
+
+### Restoring a previous version
+
+**Critical:** a restore must update four things atomically or the pipeline breaks.
+
+1. `live/{type_key}/{art_id}.json` — write the restored version
+2. `archive/{type_key}/{art_id}/{ts}.json` — archive the current live first (so the
+   displacement is itself reversible; archive before overwrite)
+3. `hash-index/current.json.gz` — recompute from restored version's metadata;
+   if skipped, the next incremental run sees the article as "changed" and re-stages
+   the current upstream version, silently undoing the restore
+4. `changed_ids.jsonl` + `decisions.jsonl` — append restore record with actor
+
+**Via Lambda (recommended):**
+```bash
+# List available archived versions
+aws s3 ls s3://f5kb-articles-{accountId}-prod/archive/Solution/K12345/
+
+# Invoke restore
+aws lambda invoke \
+  --function-name f5kb-restore-prod \
+  --payload '{
+    "type_key":    "Solution",
+    "art_id":      "K12345",
+    "archive_key": "archive/Solution/K12345/2026-07-01T02-00-00Z.json",
+    "actor":       "devinp"
+  }' \
+  response.json
+
+cat response.json
+```
+
+The Restore Lambda handles all four dependency updates automatically.
+
+**After restore:** the DB (`articles.db` / Track Lambda) is NOT automatically updated.
+If DB alignment matters, manually invoke the Track Lambda or note the restore in the
+change log and let the next scheduled run re-track.
+
 ## Documentation map (where everything lives)
 
 - **README.md** — full CLI reference (every subcommand, flags, examples, output, config).

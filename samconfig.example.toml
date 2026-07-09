@@ -1,0 +1,40 @@
+# samconfig.example.toml — copy to samconfig.toml and fill in the placeholders.
+# The real samconfig.toml is git-ignored (it carries alert emails + consumer ARNs).
+#
+# §28 — same template, two stacks. Deploy staging FIRST, always; prod only
+# ever deploys a git tag that non-prod has already run.
+#
+# Slack webhook/signing-secret + GitHub token are NOT CFN parameters — pre-create
+# them as SSM SecureStrings before deploy (§23):
+#   aws ssm put-parameter --name /f5kb/<stage>/slack/webhook-url     --type SecureString --value ...
+#   aws ssm put-parameter --name /f5kb/<stage>/slack/signing-secret  --type SecureString --value ...
+#   aws ssm put-parameter --name /f5kb/<stage>/github/token          --type SecureString --value ...
+#
+# Replace <OPS_ALERT_EMAIL> and <WTIT_ACCOUNT_ID> before deploying.
+version = 0.1
+
+[staging.build.parameters]
+cached   = true
+parallel = true
+
+[staging.deploy.parameters]
+stack_name         = "f5kb-staging"
+region             = "us-east-2"
+resolve_s3         = true
+s3_prefix          = "f5kb-staging"
+capabilities       = "CAPABILITY_NAMED_IAM"
+confirm_changeset  = false
+parameter_overrides = "Stage=staging ScheduleState=DISABLED LogLevel=DEBUG OpsAlertEmail=<OPS_ALERT_EMAIL> ConsumerReadArns='' TypeKeys=Policy,Compliance,Supplemental_Document,Release_Note"
+
+[prod.build.parameters]
+cached   = true
+parallel = true
+
+[prod.deploy.parameters]
+stack_name         = "f5kb-prod"
+region             = "us-east-2"
+resolve_s3         = true
+s3_prefix          = "f5kb-prod"
+capabilities       = "CAPABILITY_NAMED_IAM"
+confirm_changeset  = true
+parameter_overrides = "Stage=prod ScheduleState=ENABLED LogLevel=DEBUG OpsAlertEmail=<OPS_ALERT_EMAIL> ConsumerReadArns=arn:aws:iam::<WTIT_ACCOUNT_ID>:role/wtit-p2-ingest-prod TypeKeys=Support_Solution,Known_Issue,Knowledge,Security_Advisory,Video,Policy,Operations_Guide,Compliance,Education,Manual,Release_Note,Supplemental_Document,Bug_Tracker"

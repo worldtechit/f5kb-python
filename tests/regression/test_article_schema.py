@@ -7,8 +7,6 @@ Any structural change to the dump format will break these tests intentionally.
 import json
 from pathlib import Path
 
-import pytest
-
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "dump_mini"
 
 REQUIRED_TOP_LEVEL = {"id", "documentType", "title", "link", "capturedAt", "metadata", "content"}
