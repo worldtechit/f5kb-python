@@ -17,14 +17,17 @@ conditionally writes the ``track/_done`` gate, and advances ``status.json`` to
 
 from __future__ import annotations
 
+import concurrent.futures
 import datetime
 import json
 import os
 import sys
+import time
 
 import boto3
 
 from f5kb.lib.dump import db_key
+from f5kb.lib.logutil import exc_fields
 from f5kb.lib.staging import compute_risk, diff_parts
 from f5kb.storage.s3 import S3Storage
 from f5kb.track.hashing import sha256_obj
@@ -59,6 +62,19 @@ def _log(level: str, action: str, **fields: object) -> None:
 # ── entrypoint ───────────────────────────────────────────────────────────────
 
 def handler(event: dict, context: object) -> dict:
+    try:
+        return _handler(event, context)
+    except Exception as e:
+        _log("ERROR", "invocation_failed", **exc_fields(e),
+             hint="uncaught crash in track. Progress survives in "
+                  "runs/{run_date}/track/progress.json (completed types + counts); "
+                  "re-trigger by re-invoking with the scrape/_done event, or use the "
+                  "Approve Lambda resume action after fixing the cause.")
+        raise
+
+
+def _handler(event: dict, context: object) -> dict:
+    started_monotonic = time.monotonic()
     bucket = os.environ["BUCKET"]
     hash_index_key = os.environ.get("HASH_INDEX_KEY", HASH_INDEX_KEY)
 
@@ -99,6 +115,12 @@ def handler(event: dict, context: object) -> dict:
 
     changes_key = f"runs/{run_date}/track/changes.jsonl"
 
+    # Fresh start: reset changes.jsonl. A prior invocation that died MID-type
+    # (before its first progress checkpoint) leaves partial lines behind;
+    # appending on top would duplicate that type's records.
+    if not completed:
+        store.delete(changes_key)
+
     for type_key in types:
         if type_key in completed:
             continue
@@ -106,16 +128,47 @@ def handler(event: dict, context: object) -> dict:
         # Re-invoke before starting a type if we are low on time (v2 fix #7).
         if _ms_remaining(context) < TIMEOUT_MARGIN_MS:
             _save_progress(store, run_date, sorted(completed), counts)
-            _log("INFO", "self_reinvoked", run_date=run_date, types_completed=len(completed))
+            _log("INFO", "self_reinvoked", run_date=run_date,
+                 types_completed=len(completed), remaining_ms=_ms_remaining(context),
+                 next_type=type_key,
+                 hint="normal — progress saved, async self-invoke continues from next_type")
             _self_invoke(event, context)
             return {"status": "resumed", "run_date": run_date, "types_completed": len(completed)}
 
         entries = manifests.get(type_key) or []
-        for entry in entries:
-            _process_entry(store, run_date, entry, type_key, hash_index, changes_key, counts)
+        _log("INFO", "type_track_started", run_date=run_date, type_key=type_key,
+             entries=len(entries), remaining_ms=_ms_remaining(context))
+
+        # Per-article pending/live fetches run concurrently; the type's change
+        # records land in ONE batched append. The old per-article append_jsonl
+        # re-uploaded the whole growing changes.jsonl every article — O(n^2)
+        # bytes (~1 TB of PUT traffic on a full run), which made a single type
+        # outlast the 900s Lambda limit and restart from zero forever.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as ex:
+            results = list(ex.map(
+                lambda e: _build_record(store, run_date, e, type_key, hash_index),
+                entries))
+
+        records: list[dict] = []
+        for rec in results:
+            if rec is None:
+                continue
+            records.append(rec)
+            counts[rec["op"]] += 1
+            risk = rec.get("risk") or []
+            if any(f == "body-error" for f in risk):
+                counts["body_error"] += 1
+            if any(f == "body-dropped" for f in risk):
+                counts["body_dropped"] += 1
+            if any(f.startswith("body-shrank-") for f in risk):
+                counts["body_shrank"] += 1
+
+        store.append_jsonl_many(changes_key, records)
 
         completed.add(type_key)
         _save_progress(store, run_date, sorted(completed), counts)
+        _log("INFO", "type_track_complete", run_date=run_date, type_key=type_key,
+             entries=len(entries), records=len(records), running_counts=dict(counts))
 
     # All types processed — write the real risk-breakdown summary.
     summary = {
@@ -136,6 +189,8 @@ def handler(event: dict, context: object) -> dict:
     # Conditional gate: exactly one writer advances the pipeline.
     won = store.put_conditional(f"runs/{run_date}/track/_done", b"")
     if won:
+        _log("INFO", "track_done_won", run_date=run_date,
+             next_step="track/_done S3 event triggers the Approve Lambda; phase=approve")
         store.put(f"runs/{run_date}/status.json", {
             "run_date": run_date,
             "phase": "approve",
@@ -145,10 +200,13 @@ def handler(event: dict, context: object) -> dict:
         _log("INFO", "conditional_put_lost_412", run_date=run_date, key=f"runs/{run_date}/track/_done")
 
     _log("INFO", "track_complete",
-         run_date=run_date,
-         new=counts["new"], changed=counts["changed"],
+         run_date=run_date, total=articles_total,
+         new=counts["new"], changed=counts["changed"], unchanged=counts["unchanged"],
          body_shrank=counts["body_shrank"], body_dropped=counts["body_dropped"],
-         body_error=counts["body_error"])
+         body_error=counts["body_error"],
+         elapsed_ms=int((time.monotonic() - started_monotonic) * 1000),
+         hint=("body_dropped + body_error articles with a live version become HOLDS "
+               "at approve" if (counts["body_dropped"] or counts["body_error"]) else None))
 
     return {
         "run_date": run_date,
@@ -161,15 +219,16 @@ def handler(event: dict, context: object) -> dict:
 
 # ── per-article processing ─────────────────────────────────────────────────
 
-def _process_entry(
+def _build_record(
     store: S3Storage,
     run_date: str,
     entry: dict,
     type_key: str,
     hash_index: dict[str, str],
-    changes_key: str,
-    counts: dict[str, int],
-) -> None:
+) -> dict | None:
+    """Fetch pending+live and compute one change record. Pure per-article work
+    (S3 reads + hashing only, no writes) — safe to run concurrently; the
+    caller aggregates counts and batch-appends the records."""
     art_id = entry.get("id") or ""
     doc_type = type_key  # hash index keyed on type_key (matches dump.py:203)
     pending_key = entry.get("pending_key") or f"pending/{type_key}/{art_id}.json"
@@ -177,7 +236,12 @@ def _process_entry(
     try:
         pending = store.get(pending_key)
     except KeyError:
-        return
+        _log("WARN", "pending_missing", run_date=run_date, type_key=type_key,
+             id=art_id, pending_key=pending_key,
+             hint="manifest lists this article but its pending/ object is gone — "
+                  "already promoted/rejected by an earlier pass, or deleted manually; "
+                  "it is skipped and will NOT appear in track counts")
+        return None
 
     try:
         live = store.get(f"live/{type_key}/{art_id}.json")
@@ -189,14 +253,6 @@ def _process_entry(
     # auto-approves — matching the local CLI's gate semantics.
     risk = compute_risk(live, pending)
     changed = diff_parts(live, pending)
-
-    # Risk-breakdown accounting.
-    if any(f == "body-error" for f in risk):
-        counts["body_error"] += 1
-    if any(f == "body-dropped" for f in risk):
-        counts["body_dropped"] += 1
-    if any(f.startswith("body-shrank-") for f in risk):
-        counts["body_shrank"] += 1
 
     if risk:
         _log("WARN" if ("body-dropped" in risk or "body-error" in risk) else "INFO",
@@ -210,18 +266,15 @@ def _process_entry(
 
     if prior_hash is None:
         op = "new"
-        counts["new"] += 1
     elif prior_hash != current_hash:
         op = "changed"
-        counts["changed"] += 1
     else:
         op = "unchanged"
-        counts["unchanged"] += 1
 
     live_body = _body_text(live) if live else ""
     pending_body = _body_text(pending)
 
-    store.append_jsonl(changes_key, {
+    return {
         "id": art_id,
         "type_key": type_key,
         "document_type": doc_type,
@@ -231,7 +284,7 @@ def _process_entry(
         "live_chars": len(live_body) if live else 0,
         "pending_chars": len(pending_body),
         "run_date": run_date,
-    })
+    }
 
 
 # ── manifests & progress ─────────────────────────────────────────────────────
@@ -251,7 +304,10 @@ def _read_manifest(store: S3Storage, run_date: str, type_key: str) -> list[dict]
         try:
             out.append(json.loads(line))
         except Exception:
-            pass
+            _log("WARN", "manifest_line_malformed", run_date=run_date,
+                 type_key=type_key, line=line[:200],
+                 hint="skipped — a corrupt manifest line means one staged article is "
+                      "invisible to track/approve; inspect the manifest jsonl")
     return out
 
 
@@ -289,7 +345,9 @@ def _self_invoke(event: dict, context: object) -> None:
             Payload=json.dumps(event).encode("utf-8"),
         )
     except Exception as e:  # never wedge the pipeline on a re-invoke failure
-        _log("ERROR", "self_invoke_failed", error=str(e))
+        _log("ERROR", "self_invoke_failed", **exc_fields(e),
+             hint="track stopped mid-run and could NOT continue itself — progress.json "
+                  "holds completed types; re-invoke track manually with the same event")
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────

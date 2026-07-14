@@ -108,6 +108,15 @@ class LocalStorage(StorageBackend):
         with p.open("a", encoding="utf-8") as f:
             f.write(line)
 
+    def append_jsonl_many(self, key: str, entries: list[dict]) -> None:
+        if not entries:
+            return
+        p = self._p(key)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            for e in entries:
+                f.write(json.dumps(e, separators=(",", ":")) + "\n")
+
     # ── Hash index ───────────────────────────────────────────────────────────
 
     def load_hash_index(self, key: str) -> dict[str, str]:

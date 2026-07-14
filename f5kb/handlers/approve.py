@@ -34,6 +34,7 @@ import urllib.request
 import boto3
 
 from f5kb.lib.dump import db_key
+from f5kb.lib.logutil import exc_fields
 from f5kb.storage.s3 import S3Storage
 from f5kb.track.hashing import sha256_obj
 
@@ -129,12 +130,27 @@ def _ms_remaining(context: object) -> float:
 # ── Entry point ──────────────────────────────────────────────────────────────────
 
 def handler(event: dict, context: object) -> dict:
+    try:
+        return _handler(event, context)
+    except Exception as e:
+        _log("ERROR", "invocation_failed", **exc_fields(e),
+             hint="approve crashed. The started.json idempotency guard means a "
+                  "re-invoke (or the orchestrator sweep's resume action) safely "
+                  "continues — already-promoted articles are skipped via "
+                  "approved-ids. Check the traceback frame first.")
+        raise
+
+
+def _handler(event: dict, context: object) -> dict:
     bucket = os.environ["BUCKET"]
     store = S3Storage(bucket)
 
     # Route by event shape, NOT httpMethod.
     if isinstance(event, dict) and event.get("action"):
+        _log("INFO", "invocation_started", route="action",
+             requested_action=event.get("action"), run_date=event.get("run_date"))
         return _handle_action(event, store, bucket, context)
+    _log("INFO", "invocation_started", route="automatic")
     return _handle_automatic(event, store, bucket, context)
 
 
@@ -435,8 +451,13 @@ def _promote(
         archive_key = f"{ARCHIVE_PREFIX}/{type_key}/{art_id}/{_now_stamp()}.json"
         try:
             store.copy(live_key, archive_key)
-        except Exception:
-            pass  # archive failure never blocks a promotion
+        except Exception as e:
+            # Promotion still proceeds, but the pre-overwrite copy is LOST —
+            # this article cannot be rolled back from archive/ for this change.
+            _log("WARN", "archive_before_overwrite_failed", type_key=type_key,
+                 id=art_id, archive_key=archive_key, **exc_fields(e),
+                 hint="promotion continued without a rollback copy; S3 bucket "
+                      "versioning is the remaining safety net for this overwrite")
     store.copy(pending_key, live_key)
     store.delete(pending_key)
 
@@ -786,8 +807,12 @@ def _post_slack(webhook: str, payload: dict) -> None:
     )
     try:
         urllib.request.urlopen(req, timeout=5)  # noqa: S310 — trusted SSM webhook URL
-    except Exception:
-        pass  # Slack failure never blocks the pipeline
+    except Exception as e:
+        _log("WARN", "slack_webhook_failed",
+             err_type=type(e).__name__, err_msg=str(e)[:300],
+             hint="hold notification NOT delivered — nobody was pinged; the 24h "
+                  "auto-escalation watchdog is the backstop. Check the SSM webhook "
+                  "parameter and Slack app.")
 
 
 def _post_response_url(response_url: str | None, text: str) -> None:
@@ -800,8 +825,10 @@ def _post_response_url(response_url: str | None, text: str) -> None:
     )
     try:
         urllib.request.urlopen(req, timeout=5)  # noqa: S310
-    except Exception:
-        pass
+    except Exception as e:
+        _log("WARN", "slack_response_url_failed",
+             err_type=type(e).__name__, err_msg=str(e)[:300],
+             hint="the decision WAS applied — only the ephemeral Slack reply failed")
 
 
 # ── Self-reinvoke on timeout ────────────────────────────────────────────────────────
@@ -819,7 +846,10 @@ def _self_reinvoke(event: dict, context: object, run_date: str) -> dict:
             Payload=json.dumps(event).encode("utf-8"),
         )
     except Exception as e:
-        _log("ERROR", "self_reinvoked", run_date=run_date, error=str(e))
+        _log("ERROR", "self_reinvoke_failed", run_date=run_date, **exc_fields(e),
+             hint="approve stopped mid-pass and could NOT continue itself — "
+                  "started.json remains, so invoke approve with action=resume "
+                  "(or wait for the orchestrator sweep) to finish the run")
         return {"status": "reinvoke_failed", "run_date": run_date}
     _log("INFO", "self_reinvoked", run_date=run_date)
     return {"status": "self_reinvoked", "run_date": run_date}

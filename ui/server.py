@@ -15,8 +15,10 @@ Then open http://127.0.0.1:8000
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import pathlib
 import re
+import threading
 from typing import Any
 
 import uvicorn
@@ -27,11 +29,27 @@ from readers import (
     BROWSABLE_PREFIXES,
     REPO,
     Reader,
+    list_targets,
     load_target,
     page_articles,
     structured_diff,
 )
 from runview import build_run_detail, run_summary
+
+
+class ReaderRef:
+    """Mutable indirection so /api/actions/switch-target can swap the backing
+    reader in place — every route closes over this proxy, and attribute access
+    forwards to the current reader."""
+
+    def __init__(self, reader: Reader) -> None:
+        object.__setattr__(self, "_r", reader)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(object.__getattribute__(self, "_r"), name)
+
+    def switch(self, reader: Reader) -> None:
+        object.__setattr__(self, "_r", reader)
 
 HERE = pathlib.Path(__file__).resolve().parent
 
@@ -74,8 +92,10 @@ def render_markdown(text: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 #  App
 # ══════════════════════════════════════════════════════════════════════════════
-def make_app(reader: Reader) -> FastAPI:
+def make_app(reader: Reader, original_target: str = "",
+             allow_writes: bool = False) -> FastAPI:
     app = FastAPI(title="f5kb console", docs_url=None, redoc_url=None)
+    current = {"target": original_target}
 
     def _require_writes() -> None:
         if not reader.writable:
@@ -87,12 +107,21 @@ def make_app(reader: Reader) -> FastAPI:
     def config() -> dict:
         return reader.label()
 
+    def _summaries(dates: list[str]) -> list[dict]:
+        """run_summary does 2-3 store round-trips per date — run them concurrently."""
+        if not dates:
+            return []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(dates))) as ex:
+            rows = ex.map(lambda d: {"run_date": d, **run_summary(reader, d)}, dates)
+        return list(rows)
+
     @app.get("/api/overview")
     def overview() -> dict:
         dates = reader.list_run_dates(limit=8)
+        runs = _summaries(dates)
         latest: dict[str, Any] | None = None
-        if dates:
-            latest = {"run_date": dates[0], **run_summary(reader, dates[0])}
+        if runs:
+            latest = dict(runs[0])
             held = reader.get_json(f"lambda/state/{dates[0]}/approve_held.json") or {}
             latest["held"] = held.get("remaining", len(held.get("entries") or []))
         corpus = reader.corpus_counts()
@@ -100,7 +129,7 @@ def make_app(reader: Reader) -> FastAPI:
         return {
             "label": reader.label(),
             "latest": latest,
-            "runs": [{"run_date": d, **run_summary(reader, d)} for d in dates],
+            "runs": runs,
             "corpus": corpus,
             "corpus_total": sum(corpus.values()),
             "pending_total": pending["total"],
@@ -111,13 +140,15 @@ def make_app(reader: Reader) -> FastAPI:
     # ── runs ─────────────────────────────────────────────────────────────────
     @app.get("/api/runs")
     def runs(limit: int = 20) -> list[dict]:
-        dates = reader.list_run_dates(limit)
-        return [{"run_date": d, **run_summary(reader, d)} for d in dates]
+        return _summaries(reader.list_run_dates(limit))
 
     @app.get("/api/runs/{date}")
     def run_detail(date: str) -> dict:
         _check(_ID_RE, date, "run date")
-        return build_run_detail(reader, date)
+        d = build_run_detail(reader, date)
+        if d is None:
+            raise HTTPException(404, f"run {date} not found — deleted or never ran")
+        return d
 
     # ── corpus / articles ────────────────────────────────────────────────────
     @app.get("/api/corpus")
@@ -228,6 +259,59 @@ def make_app(reader: Reader) -> FastAPI:
     def errors(minutes: int = 1440) -> list[dict]:
         return reader.recent_errors(minutes)
 
+    @app.get("/api/logs")
+    def logs(fn: str = "all", minutes: int = Query(default=180, le=10080),
+             level: str = "all", q: str = "",
+             limit: int = Query(default=300, le=1000)) -> list[dict]:
+        if fn != "all":
+            _check(_ID_RE, fn, "function name")
+        if level not in ("all", "info", "error"):
+            raise HTTPException(400, "level must be all|info|error")
+        return reader.logs(fn=fn, minutes=minutes, level=level, query=q, limit=limit)
+
+    @app.get("/api/pipeline")
+    def pipeline() -> dict:
+        return reader.pipeline_state()
+
+    @app.get("/api/integrations")
+    def integrations() -> dict:
+        return reader.integrations()
+
+    @app.get("/api/health")
+    def health() -> list[dict]:
+        return reader.health_check()
+
+    @app.get("/api/costs")
+    def costs(minutes: int = Query(default=1440, le=10080)) -> dict:
+        return reader.cost_report(minutes)
+
+    @app.get("/api/targets")
+    def targets() -> dict:
+        return {"targets": list_targets(), "current": current["target"],
+                "original": original_target}
+
+    @app.post("/api/actions/switch-target")
+    def switch_target(body: dict) -> dict:
+        name = (body or {}).get("target") or ""
+        if name not in list_targets():
+            raise HTTPException(400, f"unknown target: {name}")
+        if not isinstance(reader, ReaderRef):
+            raise HTTPException(400, "target switching unavailable on this server")
+        # Safety: only the target the server was STARTED against keeps write
+        # access — a switched-to target is always read-only.
+        writable = allow_writes and name == original_target
+        try:
+            new_reader = load_target(name, writable)
+        except SystemExit as e:
+            raise HTTPException(400, str(e)) from e
+        except Exception as e:
+            raise HTTPException(502, f"could not connect to target {name}: {e}") from e
+        reader.switch(new_reader)
+        current["target"] = name
+        return {"status": "switched", "target": name,
+                "forced_read_only": bool(allow_writes and not writable),
+                **new_reader.label()}
+
     # ── docs ─────────────────────────────────────────────────────────────────
     @app.get("/api/docs")
     def docs_list() -> list[dict]:
@@ -297,6 +381,62 @@ def make_app(reader: Reader) -> FastAPI:
         return _act(reader.restore_article, type_key, art_id, archive_key,
                     b.get("actor", "dashboard"))
 
+    @app.post("/api/actions/redrive")
+    def redrive(body: dict) -> dict:
+        _require_writes()
+        b = body or {}
+        queue = _check(_ID_RE, b.get("queue") or "", "queue name")
+        try:
+            return _act(reader.redrive_dlq, queue, b.get("message_id") or None)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+
+    @app.post("/api/actions/pipeline")
+    def pipeline_action(body: dict) -> dict:
+        _require_writes()
+        action = (body or {}).get("action")
+        if action == "pause":
+            return _act(reader.set_pipeline_enabled, False)
+        if action == "resume":
+            return _act(reader.set_pipeline_enabled, True)
+        if action == "purge_queues":
+            return _act(reader.purge_queues)
+        raise HTTPException(400, "action must be pause|resume|purge_queues")
+
+    @app.post("/api/actions/pending")
+    def pending_action(body: dict) -> dict:
+        _require_writes()
+        b = body or {}
+        action = b.get("action")
+        if action not in ("approve", "reject"):
+            raise HTTPException(400, "action must be approve|reject")
+        # Whole-type mode: {action, type_key} with no items — acts on EVERY
+        # pending object of the type (bulk-optimised path).
+        if b.get("type_key") and not b.get("items"):
+            type_key = _check(_TYPE_RE, b.get("type_key") or "", "type key")
+            return _act(reader.resolve_pending_type, action, type_key,
+                        b.get("actor", "dashboard"))
+        items = b.get("items")
+        if not isinstance(items, list) or not items:
+            raise HTTPException(400, "items must be a non-empty list (or pass type_key)")
+        if len(items) > 500:
+            raise HTTPException(400, "max 500 items per request")
+        for it in items:
+            _check(_TYPE_RE, (it or {}).get("type_key") or "", "type key")
+            _check(_ID_RE, (it or {}).get("id") or "", "article id")
+        return _act(reader.resolve_pending, action, items, b.get("actor", "dashboard"))
+
+    @app.post("/api/actions/delete-run")
+    def delete_run(body: dict) -> dict:
+        b = body or {}
+        run_date = _check(_ID_RE, b.get("run_date") or "", "run date")
+        dry_run = bool(b.get("dry_run", True))
+        if not dry_run:
+            _require_writes()
+        return _act(reader.delete_run, run_date,
+                    bool(b.get("include_pending", False)), dry_run,
+                    b.get("actor", "dashboard"))
+
     @app.post("/api/actions/save-article")
     def save_article(body: dict) -> dict:
         _require_writes()
@@ -322,7 +462,7 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=8000)
     args = ap.parse_args()
 
-    reader = load_target(args.target, args.allow_writes)
+    reader = ReaderRef(load_target(args.target, args.allow_writes))
     lbl = reader.label()
     mode_note = "READ-WRITE" if lbl.get("writable") else "read-only"
     print(f"f5kb console — target={args.target} mode={lbl['mode']} "
@@ -332,7 +472,21 @@ def main() -> None:
     if lbl.get("root"):
         print(f"  root: {lbl['root']}")
     print(f"  open http://{args.host}:{args.port}")
-    uvicorn.run(make_app(reader), host=args.host, port=args.port, log_level="warning")
+
+    def warm() -> None:
+        # Pre-populate the expensive listings so the first page load doesn't
+        # pay the cold sweep; after this the SWR caches refresh in background.
+        for load in (reader.list_run_dates, reader.corpus_counts,
+                     lambda: reader.pending_entries(cap=1), reader.dlq_depths):
+            try:
+                load()
+            except Exception:
+                pass
+
+    threading.Thread(target=warm, daemon=True).start()
+    uvicorn.run(make_app(reader, original_target=args.target,
+                         allow_writes=args.allow_writes),
+                host=args.host, port=args.port, log_level="warning")
 
 
 if __name__ == "__main__":

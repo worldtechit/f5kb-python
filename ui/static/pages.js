@@ -37,6 +37,32 @@ function canDrive(ctx) {
   return ctx.cfg.writable && ctx.cfg.mode === "aws";
 }
 
+// ── dismissible alerts (per-browser; the underlying condition is unaffected) ──
+const DISMISSED_ALERTS_KEY = "f5kb-dismissed-alerts";
+
+function dismissedAlerts() {
+  try { return new Set(JSON.parse(localStorage.getItem(DISMISSED_ALERTS_KEY) || "[]")); }
+  catch (_) { return new Set(); }
+}
+
+function rememberDismissed(key) {
+  const all = [...dismissedAlerts(), key].slice(-200);
+  localStorage.setItem(DISMISSED_ALERTS_KEY, JSON.stringify(all));
+}
+
+function alertRow(a, scope) {
+  const key = `${scope}|${a.level}|${a.msg}`;
+  if (dismissedAlerts().has(key)) return null;
+  const div = el("div", "alert " + a.level);
+  div.append(html("span", null, esc(a.msg)));
+  const x = el("button", "alert-x", "✕");
+  x.title = "dismiss — hides this message in this browser only; the underlying " +
+            "condition (DLQ message, held articles…) stays until actually resolved";
+  x.onclick = () => { rememberDismissed(key); div.remove(); };
+  div.append(x);
+  return div;
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 //  Overview
 // ═════════════════════════════════════════════════════════════════════════════
@@ -232,6 +258,11 @@ async function renderRunDetail(box, date, ctx) {
   head.append(el("div", "sub", `${d.mode || "?"} run` +
     (d.mode_source ? ` (${d.mode_source})` : "") +
     (d.started_at ? ` · started ${fmtTime(d.started_at)}` : "")));
+  if (canDrive(ctx)) {
+    const right = el("div", "right");
+    right.append(await runControls(d, ctx));
+    head.append(right);
+  }
   box.append(head);
   const stepRow = el("div", "toolbar");
   stepRow.append(stepper(d.phases || ["scrape", "track", "approve", "done"], d.phase));
@@ -248,7 +279,10 @@ async function renderRunDetail(box, date, ctx) {
   box.append(stepRow);
 
   const alertsBox = el("div"); alertsBox.dataset.anchor = "alerts";
-  for (const a of d.alerts || []) alertsBox.append(el("div", "alert " + a.level, a.msg));
+  for (const a of d.alerts || []) {
+    const row = alertRow(a, date);
+    if (row) alertsBox.append(row);
+  }
   box.append(alertsBox);
 
   // per-type progress
@@ -361,12 +395,117 @@ async function renderRunDetail(box, date, ctx) {
   if ((d.held || []).length) box.append(heldSection(d, ctx));
 }
 
+// ── run controls: pause / stop / delete ──────────────────────────────────────
+async function runControls(d, ctx) {
+  const box = el("div", "btn-row");
+  let ps = null;
+  try { ps = await api.pipeline(); } catch (_) { /* non-AWS target */ }
+  let paused = !!(ps && ps.paused);
+
+  const pauseBtn = el("button", "btn sm");
+  const syncPause = () => {
+    pauseBtn.textContent = paused ? "▶ Resume pipeline" : "⏸ Pause pipeline";
+  };
+  syncPause();
+  pauseBtn.onclick = () => confirmModal(
+    paused ? "Resume the pipeline?" : "Pause the pipeline?",
+    paused
+      ? "Re-enables the dump + enrich SQS triggers. Queued messages start processing again."
+      : "Disables the dump + enrich SQS triggers. NOTHING is deleted — queued messages " +
+        "simply wait (and in-flight Lambdas finish, up to 15 min) until you resume.",
+    async () => {
+      const r = await api.pipelineAction(paused ? "resume" : "pause");
+      paused = r.status === "paused";
+      syncPause();
+      toast(`pipeline ${r.status} (${(r.functions || []).length} triggers)`);
+    });
+
+  const stopBtn = el("button", "btn danger sm", "⏹ Stop run");
+  stopBtn.onclick = () => confirmModal("Stop the in-flight run?",
+    "Pauses the SQS triggers AND purges the dump/enrich WORK queues, killing the " +
+    "self-requeue chain. Queued (unprocessed) messages are deleted; DLQ messages and " +
+    "all run data in S3 are untouched. In-flight Lambdas finish their current 15-min " +
+    "slice but cannot continue. Resume the pipeline afterwards for the next run.",
+    async () => {
+      await api.pipelineAction("pause");
+      const r = await api.pipelineAction("purge_queues");
+      const errs = Object.values(r).filter((v) => String(v).startsWith("error"));
+      toast(errs.length ? `stopped, but: ${errs[0]}` : "run stopped — triggers paused, work queues purged", !!errs.length);
+    }, { danger: true });
+
+  const delBtn = el("button", "btn danger sm", "🗑 Delete run…");
+  delBtn.onclick = () => deleteRunModal(d.run_date, ctx);
+
+  box.append(pauseBtn, stopBtn, delBtn);
+  return box;
+}
+
+function deleteRunModal(runDate, ctx) {
+  const body = el("div");
+  body.append(el("div", "alert warn",
+    "Deletes this run's tracking data: runs/" + runDate + "/ and lambda/state/" + runDate + "/. " +
+    "The live corpus, archives, audit trail, and hash-index are NEVER touched. " +
+    "Already-approved articles stay live."));
+  const cbRow = el("label", "lbl");
+  const cb = el("input");
+  cb.type = "checkbox";
+  cbRow.style.display = "flex";
+  cbRow.style.gap = "8px";
+  cbRow.style.alignItems = "center";
+  cbRow.append(cb, document.createTextNode(
+    "also delete the pending/ articles this run staged (they re-stage on the next run)"));
+  body.append(cbRow);
+  const out = el("div", "mt");
+  body.append(out);
+
+  async function preview() {
+    out.innerHTML = "";
+    out.append(el("div", "skel"));
+    try {
+      const r = await api.deleteRun({ run_date: runDate, include_pending: cb.checked, dry_run: true });
+      out.innerHTML = "";
+      const c = r.counts || {};
+      out.append(html("div", "kv", `<span>runs/${esc(runDate)}/ keys</span><span class="v">${fmtNum(c.runs || 0)}</span>`));
+      out.append(html("div", "kv", `<span>lambda/state/${esc(runDate)}/ keys</span><span class="v">${fmtNum(c.state || 0)}</span>`));
+      out.append(html("div", "kv", `<span>pending/ articles</span><span class="v ${c.pending ? "bad" : ""}">${fmtNum(c.pending || 0)}</span>`));
+      if (typeof r.dlq_messages === "number" && r.dlq_messages >= 0) {
+        out.append(html("div", "kv", `<span>DLQ messages for this run</span>` +
+          `<span class="v ${r.dlq_messages ? "bad" : ""}">${fmtNum(r.dlq_messages)}` +
+          `${r.dlq_messages ? ' <span class="dim small">(deleted with the run)</span>' : ""}</span>`));
+      }
+      out.append(html("div", "kv", `<span><b>total to delete</b></span><span class="v"><b>${fmtNum(r.total || 0)}</b></span>`));
+    } catch (e) { out.innerHTML = ""; out.append(empty(e.message)); }
+  }
+  cb.onchange = preview;
+  preview();
+
+  modal({
+    title: `Delete run ${runDate}`,
+    body,
+    actions: [
+      { label: "Cancel", cls: "ghost" },
+      {
+        label: "Delete permanently", cls: "danger",
+        onClick: async () => {
+          const r = await api.deleteRun({ run_date: runDate, include_pending: cb.checked,
+            dry_run: false, actor: "console" });
+          toast(`deleted ${fmtNum(r.total || 0)} keys for run ${runDate}`);
+          ctx.navigate("#/runs");
+        },
+      },
+    ],
+  });
+}
+
 function patchRunDetail(box, d) {
-  // Update alerts
+  // Update alerts (respecting per-browser dismissals)
   const ab = box.querySelector("[data-anchor=alerts]");
   if (ab) {
     ab.innerHTML = "";
-    for (const a of d.alerts || []) ab.append(el("div", "alert " + a.level, a.msg));
+    for (const a of d.alerts || []) {
+      const row = alertRow(a, d.run_date);
+      if (row) ab.append(row);
+    }
   }
   // Update phase stepper (replace only the stepper node)
   const stepOld = box.querySelector(".stepper");
@@ -857,6 +996,53 @@ export async function reviewPage(view, params, ctx) {
   if (!types.length) {
     card.append(empty("pending queue is empty — live corpus and upstream are in sync"));
   }
+
+  // Bulk approve/reject on the pending list (console-side; held articles above
+  // still go through the Approve Lambda).
+  const chosen = new Map(); // "type/id" -> {type_key, id}
+  let bulkBar = null;
+  const syncBulk = () => {
+    if (!bulkBar) return;
+    bulkBar.querySelectorAll("button").forEach((b) => {
+      const verb = b.dataset.verb;
+      if (!verb) return;
+      b.textContent = `${verb === "approve" ? "✓ Approve" : "✕ Reject"} selected (${chosen.size})`;
+      b.disabled = !chosen.size;
+    });
+  };
+  const bulkAct = (action) => {
+    const items = [...chosen.values()];
+    confirmModal(
+      `${action === "approve" ? "Approve" : "Reject"} ${items.length} pending article(s)?`,
+      action === "approve"
+        ? "Each is promoted to live/ with the full protocol (archive-before-overwrite, " +
+          "hash-index, audit). NOTE: no P2 handoff message is published — run a backfill " +
+          "afterwards if P2 must receive these."
+        : "The pending copies are deleted and a rejected audit record is written; " +
+          "live stays exactly as it is.",
+      async () => {
+        let done = 0, errors = 0;
+        for (let i = 0; i < items.length; i += 500) {
+          const r = await api.pendingAction({ action, items: items.slice(i, i + 500), actor: "console" });
+          done += r.done || 0; errors += (r.errors || 0) + (r.missing || 0);
+        }
+        chosen.clear();
+        toast(`${done} ${action}${action === "approve" ? "d" : "ed"}` +
+              (errors ? ` · ${errors} skipped/failed` : ""), !!errors);
+        reviewPage(clearView(view), params, ctx);
+      }, { danger: action === "reject" });
+  };
+  if (canDrive(ctx) && types.length) {
+    bulkBar = el("div", "btn-row mb");
+    const bA = el("button", "btn ok sm"); bA.dataset.verb = "approve";
+    const bR = el("button", "btn danger sm"); bR.dataset.verb = "reject";
+    bA.onclick = () => bulkAct("approve");
+    bR.onclick = () => bulkAct("reject");
+    bulkBar.append(bA, bR);
+    card.append(bulkBar);
+    syncBulk();
+  }
+
   for (const t of types) {
     const group = el("details");
     group.open = types.length <= 3;
@@ -864,16 +1050,72 @@ export async function reviewPage(view, params, ctx) {
     sum.style.cursor = "pointer";
     sum.style.padding = "6px 0";
     sum.append(html("span", null, `<b class="mono">${esc(t)}</b> <span class="dim">· ${byType[t].length} staged</span>`));
+    if (canDrive(ctx)) {
+      const selAll = el("button", "btn sm ghost", "select all");
+      selAll.style.marginLeft = "10px";
+      selAll.onclick = (ev) => {
+        ev.preventDefault(); ev.stopPropagation();
+        const boxes = group.querySelectorAll("input.psel");
+        const allOn = [...boxes].every((cb) => cb.checked);
+        boxes.forEach((cb) => {
+          cb.checked = !allOn;
+          cb.dispatchEvent(new Event("change"));
+        });
+      };
+      sum.append(selAll);
+
+      const typeAct = (action) => (ev) => {
+        ev.preventDefault(); ev.stopPropagation();
+        confirmModal(
+          `${action === "approve" ? "Approve" : "Reject"} EVERY pending ${t} article?`,
+          (action === "approve"
+            ? "Acts on every pending/ object of this type (not just the rows shown — " +
+              "the list is capped). Each is promoted to live/ with archive-before-" +
+              "overwrite + hash-index + audit. No P2 handoff is published — backfill " +
+              "afterwards if P2 needs these. Large types take a while; leave the tab open."
+            : "Deletes every pending/ object of this type (not just the rows shown). " +
+              "Live stays untouched; a rejected_type audit record is written."),
+          async () => {
+            const r = await api.pendingAction({ action, type_key: t, actor: "console" });
+            toast(`${t}: ${r.done} ${action}${action === "approve" ? "d" : "ed"} of ${r.total}` +
+                  (r.errors ? ` · ${r.errors} failed` : ""), !!r.errors);
+            reviewPage(clearView(view), params, ctx);
+          }, { danger: true });
+      };
+      const tA = el("button", "btn ok sm", "✓ type");
+      tA.title = `approve every pending ${t} article`;
+      tA.onclick = typeAct("approve");
+      const tR = el("button", "btn danger sm", "✕ type");
+      tR.title = `reject every pending ${t} article`;
+      tR.onclick = typeAct("reject");
+      tA.style.marginLeft = "8px";
+      tR.style.marginLeft = "4px";
+      sum.append(tA, tR);
+    }
     group.append(sum);
-    const rows = byType[t].map((e) => ({
-      e,
-      cells: [
+    const rows = byType[t].map((e) => {
+      const cells = [];
+      if (canDrive(ctx)) {
+        const cb = el("input", "psel");
+        cb.type = "checkbox";
+        cb.onclick = (ev) => ev.stopPropagation();
+        cb.onchange = () => {
+          const key = `${e.type_key}/${e.id}`;
+          if (cb.checked) chosen.set(key, { type_key: e.type_key, id: e.id });
+          else chosen.delete(key);
+          syncBulk();
+        };
+        cells.push({ el: cb });
+      }
+      cells.push(
         { html: `<span class="mono">${esc(e.id)}</span>` },
         { html: `<span class="dim small mono">${esc(e.key)}</span>` },
         { el: tag("view ›", "info") },
-      ],
-    }));
-    group.append(table(["id", "key", ""], rows,
+      );
+      return { e, cells };
+    });
+    const heads = canDrive(ctx) ? ["", "id", "key", ""] : ["id", "key", ""];
+    group.append(table(heads, rows,
       { onRow: (r) => ctx.navigate(`#/article/${r.e.type_key}/${r.e.id}`) }));
     card.append(group);
   }
@@ -961,16 +1203,32 @@ export async function historyPage(view, params, ctx) {
 // ═════════════════════════════════════════════════════════════════════════════
 //  Ops — infra health, errors, backfill, restore, raw browser
 // ═════════════════════════════════════════════════════════════════════════════
-function dlqMessagesModal(queue) {
+function dlqMessagesModal(queue, ctx) {
   const body = el("div");
   body.append(skeleton(4));
   modal({ title: queue, wide: true,
     sub: "up to 10 messages, peeked without consuming — nothing is deleted", body });
+  const doRedrive = (messageId, label) => confirmModal(
+    `Redrive ${label}?`,
+    "Sends the message body back to the matching WORK queue and deletes it from " +
+    "the DLQ — the type resumes from its saved cursor. Fix the underlying cause " +
+    "first: an unfixed message returns here after 3 more failed deliveries.",
+    async () => {
+      const r = await api.redrive({ queue, message_id: messageId });
+      toast(r.status === "not_found"
+        ? "message not received in the polling window — retry"
+        : `${r.moved} message(s) redriven to ${r.to}`, r.status === "not_found");
+    });
   api.dlqMessages(queue).then((msgs) => {
     body.innerHTML = "";
     if (!msgs.length) {
       body.append(empty("DLQ is empty — nothing to inspect"));
       return;
+    }
+    if (ctx && canDrive(ctx) && msgs.length > 1) {
+      const all = el("button", "btn primary sm mb", `⟳ Redrive all (${msgs.length})`);
+      all.onclick = () => doRedrive(null, `ALL ${msgs.length} messages`);
+      body.append(el("div", "btn-row mb", [all]));
     }
     for (const m of msgs) {
       const box = el("div", "card mb");
@@ -982,11 +1240,18 @@ function dlqMessagesModal(queue) {
       top.append(el("span", "right dim small", meta.join(" · ")));
       box.append(top);
       box.append(jsonBlock(m.body));
+      if (ctx && canDrive(ctx)) {
+        const rd = el("button", "btn ok sm", "⟳ Redrive this message");
+        rd.onclick = () => doRedrive(m.message_id, m.message_id);
+        box.append(el("div", "btn-row mt", [rd]));
+      }
       body.append(box);
     }
-    body.append(el("div", "alert info",
-      "To retry a type: fix the underlying cause, then send this message body to the " +
-      "matching work queue (aws sqs send-message) and delete it here — playbook § incidents."));
+    if (!(ctx && canDrive(ctx))) {
+      body.append(el("div", "alert info",
+        "Redrive buttons need --allow-writes. Manual path: send the message body to " +
+        "the matching work queue (aws sqs send-message), then delete it here."));
+    }
   }).catch((e) => { body.innerHTML = ""; body.append(empty(e.message)); });
 }
 
@@ -995,6 +1260,7 @@ export async function opsPage(view, params, ctx) {
   pageHead(view, "Operations", "queues, errors, and the manual levers");
 
   const isAws = ctx.cfg.mode === "aws";
+  if (isAws) view.append(healthCard());
   const grid = el("div", "grid cols-2");
 
   // queues
@@ -1023,7 +1289,7 @@ export async function opsPage(view, params, ctx) {
           `${isDlq ? ' <span class="dim small">view ›</span>' : ""}</span>`);
         if (isDlq) {
           row.style.cursor = "pointer";
-          row.onclick = () => dlqMessagesModal(q);
+          row.onclick = () => dlqMessagesModal(q, ctx);
         }
         qCard.append(row);
       }
@@ -1055,6 +1321,41 @@ export async function opsPage(view, params, ctx) {
     const bf = el("button", "btn sm", "Publish backfill to P2…");
     bf.onclick = () => backfillModal(ctx);
     aCard.append(el("div", "btn-row mb", [bf]));
+
+    // pipeline triggers: pause / resume / purge
+    const pRow = el("div", "btn-row mb");
+    aCard.append(pRow);
+    api.pipeline().then((ps) => {
+      let paused = !!ps.paused;
+      const pb = el("button", "btn sm");
+      const syncPb = () => {
+        pb.textContent = paused ? "▶ Resume pipeline" : "⏸ Pause pipeline";
+      };
+      syncPb();
+      pb.onclick = () => confirmModal(
+        paused ? "Resume the pipeline?" : "Pause the pipeline?",
+        paused ? "Re-enables the dump + enrich SQS triggers."
+               : "Disables the dump + enrich SQS triggers. Nothing is deleted — messages wait.",
+        async () => {
+          const r = await api.pipelineAction(paused ? "resume" : "pause");
+          paused = r.status === "paused";
+          syncPb();
+          toast(`pipeline ${r.status}`);
+        });
+      const purge = el("button", "btn danger sm", "Purge work queues");
+      purge.onclick = () => confirmModal("Purge the dump + enrich WORK queues?",
+        "Queued (unprocessed) messages are permanently deleted. DLQs are untouched. " +
+        "Use to kill a runaway self-requeue chain — pause the pipeline first.",
+        async () => {
+          const r = await api.pipelineAction("purge_queues");
+          toast(Object.entries(r).map(([q, v]) => `${q.split("-").slice(1, 3).join("-")}: ${v}`).join(" · "));
+        }, { danger: true });
+      pRow.append(pb, purge);
+      for (const t of ps.triggers || []) {
+        pRow.append(tag(`${t.function.replace(/^f5kb-/, "").replace(/-(staging|prod)$/, "")}: ${t.state}`,
+          t.state === "Enabled" ? "ok" : "warn"));
+      }
+    }).catch(() => {});
   }
   const rs = el("button", "btn sm", "Restore an article…");
   rs.onclick = () => restoreModal(ctx);
@@ -1116,7 +1417,296 @@ export async function opsPage(view, params, ctx) {
       eCard.append(table(["lambda", "when", "message"], rows));
     }).catch((e2) => { eCard.append(el("div", "dim small", e2.message)); });
     view.append(eCard);
+
+    view.append(logViewerCard());
+    view.append(costCard());
   }
+}
+
+// ── health checks ─────────────────────────────────────────────────────────────
+function healthCard() {
+  const card = el("div", "card mb");
+  const h = el("h3", null, "health checks");
+  h.append(infoDot("Health checks",
+    "End-to-end tests of everything the pipeline depends on, run from this " +
+    "machine: fetch a Coveo guest token (Aura endpoint), run one live search, " +
+    "read the S3 bucket (hash index), reach all four SQS queues, and confirm " +
+    "every Lambda function is deployed.\n\n" +
+    "First stop when a run won't start or a stage looks dead — a failing row " +
+    "names the broken dependency and what to check."));
+  card.append(h);
+  const go = el("button", "btn primary sm", "▶ Run checks");
+  card.append(el("div", "btn-row mb", [go]));
+  const out = el("div");
+  card.append(out);
+  go.onclick = async () => {
+    go.disabled = true;
+    out.innerHTML = "";
+    out.append(skeleton(5));
+    try {
+      const checks = await api.health();
+      out.innerHTML = "";
+      if (!checks.length) { out.append(empty("no checks on this target")); return; }
+      for (const c of checks) {
+        const row = el("div", "kv");
+        row.append(html("span", null,
+          `${c.ok ? '<span class="good">✓</span>' : '<span class="bad-c">✗</span>'} ` +
+          `<span class="mono">${esc(c.name)}</span>`));
+        row.append(html("span", "v " + (c.ok ? "good" : "bad"),
+          `${esc(c.detail || "")} <span class="dim small">· ${c.ms}ms</span>`));
+        out.append(row);
+        if (!c.ok && c.hint) out.append(el("div", "alert warn", c.hint));
+      }
+    } catch (e) { out.innerHTML = ""; out.append(empty(e.message)); }
+    finally { go.disabled = false; }
+  };
+  return card;
+}
+
+// ── cost + duration (from Lambda REPORT lines) ────────────────────────────────
+function costCard() {
+  const card = el("div", "card mt");
+  const h = el("h3", null, "compute cost + duration");
+  h.append(infoDot("Cost + duration",
+    "Parsed from the Lambda REPORT log lines in the selected window: invocation " +
+    "count, billed GB-seconds, peak duration, peak memory, and an estimated " +
+    "dollar figure (x86 us-east-2 rates, before any free tier).\n\n" +
+    "Compute only — S3/SQS/CloudWatch request costs are excluded (typically " +
+    "cents). A type that resumes many times shows up as many invocations."));
+  card.append(h);
+  const bar = el("div", "toolbar");
+  const winSel = el("select", "inp");
+  for (const [v, l] of [[60, "1 h"], [1440, "24 h"], [10080, "7 d"]]) {
+    winSel.append(new Option(l, String(v)));
+  }
+  winSel.value = "1440";
+  const go = el("button", "btn primary sm", "Load");
+  bar.append(winSel, go);
+  card.append(bar);
+  const out = el("div", "mt");
+  card.append(out);
+  async function load() {
+    go.disabled = true;
+    out.innerHTML = "";
+    out.append(skeleton(4));
+    try {
+      const c = await api.costs(parseInt(winSel.value, 10));
+      out.innerHTML = "";
+      if (!(c.lambdas || []).length) {
+        out.append(empty("no invocations in this window"));
+        return;
+      }
+      const rows = c.lambdas.map((r) => ({
+        cells: [
+          { html: `<span class="mono">${esc(r.lambda)}</span>` },
+          { text: fmtNum(r.invocations), cls: "num" },
+          { text: fmtNum(r.gb_seconds), cls: "num" },
+          { text: `${fmtNum(Math.round(r.max_duration_ms / 1000))}s`, cls: "num" },
+          { text: `${r.max_memory_mb}/${r.memory_mb} MB`, cls: "num" },
+          { text: `$${r.est_usd.toFixed(4)}`, cls: "num" },
+        ],
+      }));
+      out.append(table(["lambda", { label: "invocations", cls: "num" },
+        { label: "GB-s", cls: "num" }, { label: "max duration", cls: "num" },
+        { label: "peak/alloc mem", cls: "num" }, { label: "est cost", cls: "num" }], rows));
+      const t = c.totals || {};
+      out.append(html("div", "kv mt",
+        `<span><b>total</b></span><span class="v"><b>${fmtNum(t.invocations)} invocations · ` +
+        `${fmtNum(t.gb_seconds)} GB-s · $${(t.est_usd || 0).toFixed(4)}</b></span>`));
+      out.append(el("div", "dim small mt", c.note || ""));
+    } catch (e) { out.innerHTML = ""; out.append(empty(e.message)); }
+    finally { go.disabled = false; }
+  }
+  go.onclick = load;
+  return card;
+}
+
+// ── log viewer: every level, every lambda, filterable ────────────────────────
+const LOG_LAMBDAS = ["orchestrator", "dump", "enrich", "track", "approve",
+  "restore", "watchdog", "slack-ack"];
+
+function logViewerCard() {
+  const card = el("div", "card mt");
+  const h = el("h3", null, "logs — all lambdas, all levels");
+  h.append(infoDot("Log viewer",
+    "Reads CloudWatch Logs directly: INFO lines (article_staged, requeued_self, " +
+    "article_skipped…), ERROR lines, and PLATFORM lines (START/END/REPORT — REPORT " +
+    "shows duration + memory per invocation).\n\n" +
+    "Filter by lambda, level, time window, and free text (matches the whole JSON " +
+    "record — try an article id, a type key, or a run date). Click a row for the " +
+    "full structured record."));
+  card.append(h);
+
+  const bar = el("div", "toolbar");
+  const fnSel = el("select", "inp");
+  fnSel.append(new Option("all lambdas", "all"));
+  for (const f of LOG_LAMBDAS) fnSel.append(new Option(f, f));
+  const lvlSel = el("select", "inp");
+  for (const [v, l] of [["all", "all levels"], ["info", "INFO"], ["error", "ERROR"]]) {
+    lvlSel.append(new Option(l, v));
+  }
+  const winSel = el("select", "inp");
+  for (const [v, l] of [[15, "15 min"], [60, "1 h"], [180, "3 h"], [1440, "24 h"], [10080, "7 d"]]) {
+    winSel.append(new Option(l, String(v)));
+  }
+  winSel.value = "180";
+  const q = el("input", "inp grow");
+  q.placeholder = "text filter — article id, type key, run date…";
+  const sizeSel = el("select", "inp");
+  for (const n of [200, 400, 1000]) sizeSel.append(new Option(`fetch ${n}`, String(n)));
+  sizeSel.value = "400";
+  const go = el("button", "btn primary sm", "Load");
+  const tail = el("button", "btn sm", "▶ tail");
+  tail.title = "auto-reload every 5s (live view during a run); pagination resets to page 1";
+  bar.append(fnSel, lvlSel, winSel, q, sizeSel, go, tail);
+  card.append(bar);
+
+  const out = el("div", "mt");
+  card.append(out);
+  out.append(el("div", "dim small", "pick filters, press Load"));
+
+  const LEVEL_KIND = { ERROR: "bad", INFO: "info", PLATFORM: "dim", RAW: "dim" };
+  const PAGE = 50;
+  let rows = [];
+  let page = 1;
+
+  function draw() {
+    out.innerHTML = "";
+    if (!rows.length) { out.append(empty("no log events match")); return; }
+    const pages = Math.max(1, Math.ceil(rows.length / PAGE));
+    page = Math.max(1, Math.min(page, pages));
+    const window_ = rows.slice((page - 1) * PAGE, page * PAGE);
+    const trows = window_.map((r) => ({
+      r,
+      cells: [
+        { el: tag(r.lambda || "?", "info") },
+        { el: tag(r.level || "?", LEVEL_KIND[r.level] || "dim") },
+        { text: fmtTime(r.ts), cls: "mono nowrap" },
+        { html: `<span class="small">${esc(r.msg || "")}</span>` },
+      ],
+    }));
+    out.append(table(["lambda", "level", "when", "message"], trows, {
+      onRow: (row) => modal({
+        title: `${row.r.lambda} · ${row.r.level} · ${fmtTime(row.r.ts)}`,
+        wide: true,
+        body: jsonBlock(row.r.record || { message: row.r.msg }),
+      }),
+    }));
+    out.append(pager(page, pages, (p) => { page = p; draw(); }));
+    out.append(el("div", "dim small mt",
+      `${fmtNum(rows.length)} events fetched (newest first) · page ${page}/${pages}`));
+  }
+
+  async function load() {
+    out.innerHTML = "";
+    out.append(skeleton(5));
+    go.disabled = true;
+    try {
+      rows = await api.logs(fnSel.value, parseInt(winSel.value, 10),
+        lvlSel.value, q.value.trim(), parseInt(sizeSel.value, 10));
+      page = 1;
+      draw();
+    } catch (e) {
+      out.innerHTML = "";
+      out.append(empty(e.message));
+    } finally {
+      go.disabled = false;
+    }
+  }
+  go.onclick = load;
+  q.onkeydown = (ev) => { if (ev.key === "Enter") load(); };
+
+  let tailTimer = null;
+  const stopTail = () => {
+    clearInterval(tailTimer);
+    tailTimer = null;
+    tail.textContent = "▶ tail";
+    tail.classList.remove("primary");
+  };
+  tail.onclick = () => {
+    if (tailTimer) { stopTail(); return; }
+    tail.textContent = "⏸ tail";
+    tail.classList.add("primary");
+    load();
+    tailTimer = setInterval(() => {
+      // self-clean if the user navigated away and the card left the DOM
+      if (!document.contains(card)) { stopTail(); return; }
+      if (document.hidden || go.disabled) return;
+      load();
+    }, 5000);
+  };
+  return card;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Integrations — SNS topics + subscriber queues (downstream ingestion status)
+// ═════════════════════════════════════════════════════════════════════════════
+export async function integrationsPage(view, params, ctx) {
+  view.append(skeleton(5));
+  let data = {};
+  try { data = await api.integrations(); } catch (_) { /* local target */ }
+  view.innerHTML = "";
+  pageHead(view, "Integrations",
+    "SNS topics, who subscribes to them, and each subscriber queue's backlog");
+
+  if (!(data.topics || []).length) {
+    view.append(empty(ctx.cfg.mode === "aws"
+      ? "no f5kb SNS topics found for this stage"
+      : "local mode — integrations live in the deployed AWS stage"));
+    return;
+  }
+
+  const banner = el("div", "toolbar mb");
+  banner.append(tag(data.last_handoff_run
+    ? `last completed handoff: ${data.last_handoff_run}` : "no completed handoff yet",
+    data.last_handoff_run ? "ok" : "dim"));
+  banner.append(infoDot("Reading this page",
+    "The handoff topic gets ONE message per completed run (after Gate 1); every " +
+    "subscribed queue receives a copy.\n\n" +
+    "A subscriber queue's visible + in-flight counts are its ingestion backlog: " +
+    "0/0 means the consumer has drained everything it was sent; growing visible " +
+    "means the consumer is behind or down. Queues in other AWS accounts can't be " +
+    "read from here — they show as 'no access'."));
+  view.append(banner);
+
+  for (const t of data.topics || []) {
+    const card = el("div", "card mb");
+    const h = el("h3", null, t.name);
+    if (t.is_handoff) h.append(document.createTextNode(" ")), h.append(tag("P2 handoff", "ok"));
+    card.append(h);
+    card.append(el("div", "dim small mono mb", t.arn));
+    if (!(t.subscriptions || []).length) {
+      card.append(empty("no subscribers"));
+    } else {
+      const rows = t.subscriptions.map((s) => {
+        const qi = s.queue;
+        let statusCell;
+        if (!qi) statusCell = { html: `<span class="dim">—</span>` };
+        else if (!qi.accessible) statusCell = { el: tag("no access", "dim") };
+        else {
+          const backlog = (qi.visible || 0) + (qi.in_flight || 0);
+          statusCell = { html:
+            `<span class="${backlog ? "" : "good"}">${fmtNum(qi.visible)} visible` +
+            ` · ${fmtNum(qi.in_flight)} in-flight` +
+            (qi.delayed ? ` · ${fmtNum(qi.delayed)} delayed` : "") + `</span>` };
+        }
+        return {
+          cells: [
+            { el: tag(s.protocol || "?", s.protocol === "sqs" ? "info" : "dim") },
+            { html: `<span class="mono small">${esc(s.endpoint || "")}</span>` },
+            statusCell,
+            { el: qi && qi.accessible
+                ? tag(((qi.visible || 0) + (qi.in_flight || 0)) ? "ingesting / backlog" : "drained",
+                      ((qi.visible || 0) + (qi.in_flight || 0)) ? "warn" : "ok")
+                : el("span") },
+          ],
+        };
+      });
+      card.append(table(["protocol", "endpoint", "queue backlog", "status"], rows));
+    }
+    view.append(card);
+  }
+  ctx.setRefresh(() => refreshInPlace(view, params, ctx, integrationsPage), 15000);
 }
 
 function backfillModal(ctx) {

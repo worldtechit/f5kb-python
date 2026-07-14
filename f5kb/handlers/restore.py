@@ -35,6 +35,7 @@ import sys
 import boto3
 
 from f5kb.lib.dump import db_key
+from f5kb.lib.logutil import exc_fields
 from f5kb.storage.s3 import S3Storage
 from f5kb.track.hashing import sha256_obj
 
@@ -57,6 +58,17 @@ def _log(level: str, action: str, **fields: object) -> None:
 
 
 def handler(event: dict, context: object) -> dict:
+    try:
+        return _handler(event, context)
+    except Exception as e:
+        _log("ERROR", "invocation_failed", **exc_fields(e),
+             hint="restore crashed — live/ may or may not have been rewritten; "
+                  "check the last live_archived / live_written log line to see how "
+                  "far it got before failing")
+        raise
+
+
+def _handler(event: dict, context: object) -> dict:
     """
     event keys:
       type_key    (required) e.g. "Support_Solution"
@@ -117,7 +129,9 @@ def handler(event: dict, context: object) -> dict:
             store.put(displaced_to, current)
             _log("INFO", "live_archived", live_key=live_key, displaced_to=displaced_to)
         except Exception as e:  # noqa: BLE001 — archive failure never blocks restore
-            _log("WARN", "live_archive_failed", live_key=live_key, error=str(e))
+            _log("WARN", "live_archive_failed", live_key=live_key, **exc_fields(e),
+                 hint="restore continued WITHOUT a rollback copy of the displaced "
+                      "live version; S3 bucket versioning is the remaining safety net")
             displaced_to = None
 
     # ── (b) Write restored content to live/ ───────────────────────────────────
@@ -187,7 +201,9 @@ def handler(event: dict, context: object) -> dict:
         _log("INFO", "sns_published", batch="restore", manifest_key=manifest_key,
              article_count=1)
     except Exception as e:  # noqa: BLE001 — SNS failure never blocks the restore
-        _log("ERROR", "sns_publish_failed", manifest_key=manifest_key, error=str(e))
+        _log("ERROR", "sns_publish_failed", manifest_key=manifest_key, **exc_fields(e),
+             hint="the restore APPLIED but P2 was not notified — publish a backfill "
+                  "with this manifest_key from the console Operations page")
 
     _log("INFO", "restore_complete", run_date=today, type_key=type_key, art_id=art_id,
          live_key=live_key, manifest_key=manifest_key, sns_published=sns_published)

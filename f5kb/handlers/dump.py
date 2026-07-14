@@ -13,6 +13,7 @@ v2.1 changes:
 
 from __future__ import annotations
 
+import concurrent.futures
 import datetime
 import json
 import os
@@ -29,6 +30,7 @@ from f5kb.coveo.dates import date_aq
 from f5kb.coveo.fields import flatten_fields_safe, split_entry
 from f5kb.lib.dump import db_key
 from f5kb.lib.fsutil import id_of
+from f5kb.lib.logutil import exc_fields
 from f5kb.storage.s3 import S3Storage
 from f5kb.track.hashing import sha256_obj
 
@@ -71,6 +73,20 @@ def _log(level: str, action: str, **fields: object) -> None:
 
 
 def handler(event: dict, context: object) -> dict:
+    try:
+        return _handler(event, context)
+    except Exception as e:
+        # One structured record for EVERY crash — the raw runtime traceback is
+        # not JSON and invisible to the console's log viewer.
+        _log("ERROR", "invocation_failed", **exc_fields(e),
+             hint="uncaught crash; SQS will redeliver this message (maxReceiveCount 3, "
+                  "then dump DLQ). Check the traceback frame, then the cursor at "
+                  "lambda/state/{run_date}/dump-{type_key}.json to see where it stopped.")
+        raise
+
+
+def _handler(event: dict, context: object) -> dict:
+    started_monotonic = time.monotonic()
     bucket = os.environ["BUCKET"]
     queue_url = os.environ["DUMP_QUEUE_URL"]
     page_size = int(os.environ.get("PAGE_SIZE", PAGE_SIZE_DEFAULT))
@@ -86,9 +102,6 @@ def handler(event: dict, context: object) -> dict:
     enrichable: bool = msg.get("enrichable", type_key in ENRICHABLE)
     attempt: int = int(msg.get("attempt", 0))  # consecutive failed-retry count
 
-    _log("INFO", "invocation_started", run_date=run_date, type_key=type_key,
-         mode=mode, enrichable=enrichable)
-
     # Load type config from S3 if available; fall back to identity mapping.
     document_type = type_key
     type_cfg_raw: dict = {}
@@ -97,7 +110,10 @@ def handler(event: dict, context: object) -> dict:
         type_cfg_raw = all_type_cfgs.get(type_key) or {}
         document_type = type_cfg_raw.get("documentType") or type_key
     except KeyError:
-        pass
+        _log("WARN", "type_config_missing", run_date=run_date, type_key=type_key,
+             key="lambda/config/types.json",
+             hint="falling back to identity mapping (documentType=type_key, metadata='*'). "
+                  "Run scripts/sync_lambda_config.py if field splits look wrong.")
 
     # The wildcard MUST be the string "*" — selects() treats a LIST ["*"] as a
     # literal field name that matches nothing, which silently strips every
@@ -118,14 +134,30 @@ def handler(event: dict, context: object) -> dict:
     written_so_far: int = cursor_state.get("written", 0)
     count_server: int = cursor_state.get("count_server", 0)
 
+    _log("INFO", "invocation_started", run_date=run_date, type_key=type_key,
+         mode=mode, enrichable=enrichable, attempt=attempt or None,
+         resumed=bool(cursor_state) or None, rowid_cursor=rowid_cursor,
+         written_so_far=written_so_far or None, count_server=count_server or None,
+         page_size=page_size, hash_index_entries=len(hash_index),
+         remaining_ms=_ms_remaining(context))
+
     # Fetch a fresh Coveo token for this invocation.
-    coveo_config = fetch_coveo_config()
+    try:
+        coveo_config = fetch_coveo_config()
+    except Exception as e:
+        _log("ERROR", "coveo_token_fetch_failed", run_date=run_date,
+             type_key=type_key, **exc_fields(e),
+             hint="the Salesforce Aura HeadlessController.getHeadlessConfiguration "
+                  "endpoint failed — check my.f5.com availability. No cursor was "
+                  "lost; SQS redelivers this message.")
+        raise
     http = httpx.Client(timeout=60.0)
     client = CoveoClient(coveo_config, client=http)
 
     sqs = boto3.client("sqs")
     captured_at = _now_iso()
     written = 0
+    skipped = 0
 
     # Build aq base: incremental adds a 48h date window; full uses entire corpus.
     aq_base = f'@f5_document_type=="{document_type}"'
@@ -145,7 +177,11 @@ def handler(event: dict, context: object) -> dict:
             if _ms_remaining(context) < TIMEOUT_MARGIN_MS:
                 total = written_so_far + written
                 _log("INFO", "timeout_approaching", run_date=run_date,
-                     type_key=type_key, written=total, rowid_cursor=cursor)
+                     type_key=type_key, written=total, rowid_cursor=cursor,
+                     remaining_ms=_ms_remaining(context),
+                     pages_this_invocation=pages_processed,
+                     hint="normal for large types — cursor saved, message re-queued, "
+                          "next invocation continues from this rowid")
                 _save_cursor(store, cursor_key, {
                     "run_date": run_date,
                     "type_key": type_key,
@@ -199,7 +235,12 @@ def handler(event: dict, context: object) -> dict:
                 if streak >= MAX_FAILURE_RETRIES:
                     # Persistent failure — hand over to the SQS redrive → DLQ.
                     _log("ERROR", "page_fetch_failed", run_date=run_date,
-                         type_key=type_key, error=str(e), attempt=streak, final=True)
+                         type_key=type_key, error=str(e), attempt=streak, final=True,
+                         rowid_cursor=cursor, **exc_fields(e),
+                         hint=f"{MAX_FAILURE_RETRIES} consecutive no-progress attempts — "
+                              "raising so SQS redrive delivers to the dump DLQ. Cursor is "
+                              "saved; after fixing the cause, re-send the DLQ message body "
+                              "to the dump queue to resume from this rowid.")
                     raise
                 delay = min(900, FAILURE_RETRY_DELAY_S * (streak + 1))
                 sqs.send_message(
@@ -216,7 +257,10 @@ def handler(event: dict, context: object) -> dict:
                 )
                 _log("ERROR", "page_fetch_failed", run_date=run_date,
                      type_key=type_key, error=str(e), attempt=streak,
-                     retry_in_s=delay)
+                     retry_in_s=delay, rowid_cursor=cursor, **exc_fields(e),
+                     hint="transient page-fetch failure — cursor saved, retry message "
+                          f"queued with a {delay}s delay (attempt {streak + 1} of "
+                          f"{MAX_FAILURE_RETRIES} before DLQ)")
                 return {"status": "retry_scheduled", "type_key": type_key,
                         "attempt": streak + 1, "retry_in_s": delay}
 
@@ -236,7 +280,9 @@ def handler(event: dict, context: object) -> dict:
 
             batch = data.get("results") or []
             _log("INFO", "page_fetched", run_date=run_date, type_key=type_key,
-                 batch=len(batch), rowid_cursor=cursor, count_server=count_server)
+                 batch=len(batch), rowid_cursor=cursor, count_server=count_server,
+                 staged_so_far=written_so_far + written, skipped_so_far=skipped,
+                 page=pages_processed, remaining_ms=_ms_remaining(context))
             if not batch:
                 break
 
@@ -245,6 +291,11 @@ def handler(event: dict, context: object) -> dict:
             if last_rowid is None:
                 break
 
+            # Build the page's envelopes first (cheap, in-memory), then stage
+            # them with concurrent puts and ONE batched manifest append. The
+            # old per-article append_jsonl re-uploaded the whole growing
+            # manifest each article — O(n^2) bytes (~155 GB for a 47k type).
+            staged: list[tuple[str, dict, dict]] = []  # (pending_key, envelope, manifest_rec)
             for r in batch:
                 fields = flatten_fields_safe(r)
                 split = split_entry(fields, type_cfg)
@@ -258,8 +309,10 @@ def handler(event: dict, context: object) -> dict:
                 mh = sha256_obj(metadata)
                 key = db_key(type_key, art_id)
                 if hash_index.get(key) == mh:
+                    skipped += 1
                     _log("INFO", "article_skipped", run_date=run_date,
-                         type_key=type_key, id=art_id, reason="unchanged")
+                         type_key=type_key, id=art_id, reason="unchanged",
+                         detail="metadata_hash matches hash-index entry — not re-staged")
                     continue
 
                 op = "changed" if key in hash_index else "new"
@@ -279,20 +332,25 @@ def handler(event: dict, context: object) -> dict:
                     "metadata": metadata,
                     "content": content,
                 }
-                pending_key = f"pending/{type_key}/{art_id}.json"
-                store.put(pending_key, envelope)
-
-                store.append_jsonl(manifest_key, {
+                staged.append((f"pending/{type_key}/{art_id}.json", envelope, {
                     "op": op,
                     "id": art_id,
                     "type_key": type_key,
                     "s3_key": f"live/{type_key}/{art_id}.json",
                     "run_date": run_date,
                     "approved_by": None,
-                })
-                _log("INFO", "article_staged", run_date=run_date,
-                     type_key=type_key, id=art_id, op=op)
-                written += 1
+                }))
+
+            if staged:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=16) as ex:
+                    list(ex.map(lambda s: store.put(s[0], s[1]), staged))
+                # Manifest lines land AFTER every envelope put succeeded, in
+                # page order (enrich consumes the manifest by line offset).
+                store.append_jsonl_many(manifest_key, [s[2] for s in staged])
+                for _, env, rec in staged:
+                    _log("INFO", "article_staged", run_date=run_date,
+                         type_key=type_key, id=env["id"], op=rec["op"])
+                written += len(staged)
 
             cursor = int(last_rowid)
             if len(batch) < page_size:
@@ -314,7 +372,11 @@ def handler(event: dict, context: object) -> dict:
     })
     store.put_marker(f"runs/{run_date}/dump/{type_key}/_done")
     _log("INFO", "type_complete", run_date=run_date, type_key=type_key,
-         written=total, count_server=count_server, enrichable=enrichable)
+         written=total, skipped_unchanged=skipped, count_server=count_server,
+         enrichable=enrichable, pages_this_invocation=pages_processed,
+         elapsed_ms=int((time.monotonic() - started_monotonic) * 1000),
+         next_step=("Enrich Lambda fires from the dump/_done S3 event"
+                    if enrichable else "terminal-gate check runs now"))
 
     # Enrichable types hand off to the Enrich Lambda, which writes
     # enrich/{TypeKey}/_done and runs the terminal gate. For non-enrichable
@@ -378,21 +440,26 @@ def _check_and_write_scrape_done(
         + store.list_prefix(f"runs/{run_date}/enrich/")
     )
 
-    terminal = []
+    missing = []
     for t in types:
-        if t in enrichable:
-            terminal.append(f"runs/{run_date}/enrich/{t}/_done" in done_keys)
-        else:
-            terminal.append(f"runs/{run_date}/dump/{t}/_done" in done_keys)
+        marker = (f"runs/{run_date}/enrich/{t}/_done" if t in enrichable
+                  else f"runs/{run_date}/dump/{t}/_done")
+        if marker not in done_keys:
+            missing.append(t)
 
-    if not all(terminal):
+    if missing:
         _log("INFO", "terminal_gate_pending", run_date=run_date,
-             done=sum(terminal), total=len(types))
+             done=len(types) - len(missing), total=len(types),
+             waiting_on=missing,
+             hint="scrape/_done is not written until every listed type reaches its "
+                  "terminal marker — if one stays here across invocations, check its "
+                  "queue message, cursor state, and the dump DLQ")
         return
 
     won = store.put_conditional(f"runs/{run_date}/scrape/_done", b"")
     if won:
-        _log("INFO", "scrape_done_won", run_date=run_date, total=len(types))
+        _log("INFO", "scrape_done_won", run_date=run_date, total=len(types),
+             next_step="scrape/_done S3 event triggers the Track Lambda; phase=track")
         store.put(f"runs/{run_date}/status.json", {
             "run_date": run_date,
             "phase": "track",

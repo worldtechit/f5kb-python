@@ -65,6 +65,133 @@ reference-only).
 ---
 
 
+## DONE 2026-07-13: O(n^2) JSONL APPEND FIX — TRACK + DUMP BATCH WRITES
+
+Track died in an infinite restart loop on the 07-10 full run (105k articles):
+`_process_entry` called `append_jsonl(changes.jsonl)` PER ARTICLE, and each S3
+append re-uploads the whole growing file — O(n^2) bytes (~1 TB of PUT traffic
+per full run). One type outlasted the 900s Lambda limit, progress.json only
+checkpoints at type boundaries, so every retry restarted from zero. Fix:
+`append_jsonl_many` on the storage backends (S3: one get + one put for N
+lines; local: one open-append), track batches each type's records into ONE
+write with per-article pending/live GETs parallelized (ThreadPool 16), and a
+fresh start resets changes.jsonl so partial lines from crashed attempts can't
+duplicate. Dump had the identical bug on the per-type manifest (~155 GB for a
+47k type) — now stages each page with concurrent envelope puts + ONE manifest
+append (page order preserved; enrich consumes by line offset). Regression
+tests pin one-write-per-type (track), one-write-per-page (dump), and the
+stale-partial reset. Requires redeploy.
+
+---
+
+
+## DONE 2026-07-13: WATCHDOG STALL AUTO-REDRIVE (SELF-HEALING RUNS)
+
+Root cause of the 07-10 run stalling 2.5 days at 97%: Manual's enrich
+self-requeue message failed 3 deliveries while the pipeline triggers were
+paused (Pause caught it mid-retry), landed in the enrich DLQ, and nothing ever
+redrives a DLQ. Fix: the watchdog (now hourly, was daily 06:00) gained a stall
+sweep. For each DLQ message it applies `stall_decision` (pure, unit-tested):
+run OPEN + work queue EMPTY + cursor STALE (>STALL_AGE_H, default 1h) or
+absent + under the redrive cap → re-send the body to the work queue (with a
+`watchdog_redrives` counter bumped) and delete from the DLQ; the type resumes
+from its saved cursor. Bounds against runaway compute: max WATCHDOG_MAX_REDRIVES
+(3) per message then escalate-only (~$0.15 worst-case per stuck type), one
+attempt per hourly pass, never touches closed-run orphans or busy queues.
+Action alerts (redrive/cap/escalation) email any hour; the outstanding-holds
+digest stays once daily (06:00) so hourly cron doesn't spam. Template: DLQ arns
+added to the PipelineQueues IAM Sid, queue URL env vars on the watchdog,
+schedule rate(1 hour). NOTE: staging ScheduleState=DISABLED — enable the
+f5kb-watchdog-staging schedule manually for staging self-healing. Moto tests:
+redrive moves message + bumps counter, cap leaves it, orphan/busy untouched.
+
+---
+
+
+## DONE 2026-07-10: CONSOLE OPS SUITE — HEALTH, REDRIVE, COSTS, TAIL, TARGET SWITCH
+
+Six console features. (1) Health checks on Operations: Coveo token + one live
+search, bucket read, queue reachability, Lambda deployment — failing rows carry
+a what-to-check hint (`/api/health`). (2) DLQ redrive: per-message or redrive-
+all buttons in the DLQ peek modal — body re-sent to the work queue, message
+deleted from the DLQ (`/api/actions/redrive`, writes-gated). (3) Compute cost +
+duration panel: REPORT platform lines parsed per lambda into invocations,
+billed GB-seconds, peak duration/memory, estimated dollars (`/api/costs`;
+`parse_report_line` unit-tested). (4) Live log tail toggle (5s auto-reload,
+self-cleans when leaving the page). (5) Delete-run now also counts (dry run) /
+deletes (real run) DLQ messages whose body references the run_date. (6) Target
+switcher dropdown in the topbar: hot-swaps the backing reader via a ReaderRef
+proxy (`/api/targets` + `/api/actions/switch-target`); switched-to targets are
+FORCED read-only — only the startup target ever keeps writes; undeployed prod
+loads gracefully (health page names what's missing). Whole-type bulk
+approve/reject also landed on Review (`resolve_pending_type`, bulk-optimised:
+one hash-index save + batched audit appends instead of per-article O(n^2)),
+plus dismissible run alerts (per-browser) and a 404 for deleted/unknown runs.
+
+---
+
+
+## DONE 2026-07-10: REVIEW BULK ACTIONS + LOG PAGINATION + AI-WALKABLE LAMBDA LOGGING
+
+(1) Review page: checkbox selection (per-type select-all) + bulk approve/reject
+on pending staged articles via `/api/actions/pending` (chunked 500/request).
+Approve runs the console-side full protocol (`resolve_pending` →
+archive-before-overwrite + hash-index + audit); NO P2 handoff SNS is published —
+backfill afterwards if P2 must receive them. Held articles still route through
+the Approve Lambda. (2) Log viewer paginated (50/page, fetch-size selector).
+(3) Logging overhaul across all 8 Lambda handlers for AI-assisted root cause:
+new `f5kb/lib/logutil.exc_fields()` adds err_type/err_msg/trimmed-traceback to
+every error; every handler wraps its body so uncaught crashes emit a structured
+`invocation_failed` record with a `hint` field (what to check next) instead of
+a raw non-JSON runtime traceback; previously-silent paths now log (track's
+missing-pending skip, approve's archive-before-overwrite failure, Slack webhook
+failures, orchestrator sweep case B resume, SSM token fetch failures, malformed
+manifest lines); terminal gates log WHICH types they wait on; invocation
+entry/exit records carry remaining_ms/elapsed_ms/counts/next_step. NOTE: the
+handler logging lands only after `sam build && sam deploy`.
+
+---
+
+
+## DONE 2026-07-10: CONSOLE OPS EXPANSION — LOGS, RUN CONTROLS, INTEGRATIONS
+
+Four console additions. (1) Fixed the "DLQ shows N messages but click shows
+nothing" bug: `dlq_messages` used a short poll (WaitTimeSeconds=0) which samples
+a subset of SQS servers and misses sparse queues — now long-polls with retries
+until the approximate depth is gathered. (2) Full log viewer on Operations:
+CloudWatch logs for all 8 lambdas, INFO/ERROR/platform lines, filterable by
+function/level/window/free text, row click shows the structured record
+(`/api/logs`). (3) Run controls on the run detail page + Operations (writes
+only): pause/resume the dump+enrich SQS triggers, stop a run (pause + purge
+work queues, DLQs untouched), and delete a run's tracking data (`runs/{date}/`
++ `lambda/state/{date}/`, optional pending/ cleanup resolved from the run's own
+manifests) with a dry-run preview, hard guard against non-run-scoped keys, and
+an audit record. Added `delete_many` batch delete to the storage backends.
+(4) New Integrations tab: every f5kb SNS topic, its subscribers, and each
+subscriber queue's visible/in-flight/delayed backlog = live downstream
+ingestion status. Tests in tests/unit/test_ui_readers.py (delete-run scoping).
+
+---
+
+
+## DONE 2026-07-10: CONSOLE PERFORMANCE — HASH-INDEX CORPUS + SWR CACHING
+
+The console against AWS was taking ~30s per page: corpus counts swept every
+`live/<Type>/` prefix with sequential `list_objects_v2` pagination, `pending/`
+(68k keys during a stalled run) was re-listed uncached on every poll, run detail
+issued ~50 serial GETs plus multi-MB manifest downloads per 15s refresh, and the
+~3MB hash index was re-downloaded per overview poll. Fixed without a database:
+corpus counts + per-type key lists now derive from `hash-index/current.json.gz`
+(one GET; `?refresh=true` still LISTs as ground truth), all expensive listings
+sit behind a stale-while-revalidate cache (`_TTLCache.swr`) so polls never block,
+per-type run state is fetched in parallel batches (`get_json_many`), manifest
+line counts are short-TTL cached, DLQ depths/queue URLs are cached + parallel,
+and the server pre-warms caches at startup. Warm loads: overview ~0.2s, run
+detail ~0.5s, corpus instant. Tests: `tests/unit/test_ui_readers.py`.
+
+---
+
+
 ## DONE 2026-07-08: WEB CONSOLE (ui/) — FULL REDESIGN
 
 Rebuilt the dashboard into a full console (FastAPI + no-build ES-module frontend):

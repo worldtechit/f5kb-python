@@ -242,6 +242,59 @@ aws lambda invoke --function-name f5kb-orchestrator-staging \
 
 ---
 
+## 8b. Deploying (staging release checklist)
+
+Staging runs on the prod cadence since 2026-07-13: **daily run at 02:00 UTC**
+(incremental Mon–Sat, full on Sunday) plus the **hourly watchdog** (stale-hold
+escalation + stall auto-redrive). `ScheduleState=ENABLED` is baked into
+`samconfig.toml [staging]`, so schedules survive every deploy — no manual
+toggling.
+
+```bash
+# 0. gate — everything green before shipping
+uv run pytest
+
+# 1. build + deploy (--config-env on BOTH; build has its own [staging] section)
+sam build --config-env staging
+sam deploy --config-env staging
+
+# 2. ONLY if config.yaml changed since the last deploy:
+make sync-config BUCKET={BucketName}
+
+# 3. verify schedules
+aws scheduler list-schedules --region us-east-2 \
+  --query 'Schedules[].{name:Name,state:State}' --output table
+# expect: f5kb-daily-staging ENABLED, f5kb-watchdog-staging ENABLED
+
+# 4. verify the stack: console → Operations → health checks → "Run checks"
+#    (Coveo token, live search, bucket, queues, lambdas — all green)
+```
+
+**Schedule semantics to remember:**
+
+- The `ScheduleState` CloudFormation parameter owns BOTH schedules. A manual
+  `aws scheduler update-schedule` toggle is reset by the next deploy — change
+  cadence in `samconfig.toml`, not by hand.
+- Pausing the pipeline from the console (Pause button) stops the WORKERS, not
+  the schedule — the 02:00 cron still fires and its orchestrator sweep will
+  first try to close any prior open run. Pausing across a retry window can
+  strand a resume message in a DLQ; the hourly watchdog auto-redrives it
+  (capped at 3 attempts, then it emails and waits for a human).
+- Deploying mid-run is safe for S3 state (cursors, markers, manifests survive),
+  but an in-flight Lambda finishes on the OLD code and the next resume runs on
+  the NEW code — prefer deploying while no run is active.
+
+**Watchdog self-healing (what the emails mean):**
+
+| Email subject contains | Meaning | Your action |
+|---|---|---|
+| `stalled type(s) auto-redriven` | a dead resume message was re-queued; run continues | none — informational |
+| `redrive cap exceeded — NEEDS HUMAN` | same message died 3+ times; something is actually broken | check the type's logs (Operations → log viewer), fix cause, redrive from the DLQ modal |
+| `hold(s) escalated` | holds older than 24h were auto-approved | review History → decisions |
+| `outstanding held approvals` (daily 06:00) | holds waiting on a decision | Review page → approve/reject |
+
+---
+
 ## 9. Console operation
 
 ```bash

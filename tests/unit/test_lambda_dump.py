@@ -411,3 +411,32 @@ def test_incremental_mode_adds_date_window(aws, coveo):
     handler(_sqs_event(_msg("Policy", mode="incremental")), _Ctx())
 
     assert "@date>=" in _FAKE_CALLS[0]["aq"]
+
+
+def test_manifest_written_in_one_batch_per_page(aws, coveo, monkeypatch):
+    """Every staged article used to append_jsonl the manifest individually —
+    whole-file re-upload per article, O(n^2) bytes (~155 GB for a 47k type).
+    A page of staged articles must land as ONE manifest write."""
+    store, _, _ = aws
+    coveo.append({"totalCount": 3, "results": [
+        _result("K901", 10), _result("K902", 11), _result("K903", 12),
+    ]})
+
+    writes = {"manifest": 0}
+    orig = S3Storage.put_bytes
+
+    def counting(self, key, data, content_type="application/octet-stream"):
+        if "/manifest/" in key:
+            writes["manifest"] += 1
+        return orig(self, key, data, content_type)
+
+    monkeypatch.setattr(S3Storage, "put_bytes", counting)
+
+    from f5kb.handlers.dump import handler
+    result = handler(_sqs_event(_msg("Policy")), _Ctx())
+
+    assert result["status"] == "done"
+    raw = store.get_bytes(f"runs/{RUN_DATE}/manifest/Policy.jsonl").decode()
+    ids = [json.loads(ln)["id"] for ln in raw.splitlines() if ln.strip()]
+    assert ids == ["K901", "K902", "K903"]  # page order preserved (enrich offsets)
+    assert writes["manifest"] == 1

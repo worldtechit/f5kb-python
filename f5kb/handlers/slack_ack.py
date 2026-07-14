@@ -63,7 +63,10 @@ def _get_signing_secret() -> str | None:
                 Name=param, WithDecryption=True
             )["Parameter"]["Value"] or None
         except Exception as e:
-            _log("ERROR", "signing_secret_load_failed", error=str(e))
+            _log("ERROR", "signing_secret_load_failed",
+                 err_type=type(e).__name__, err_msg=str(e)[:300],
+                 hint="EVERY Slack callback will be rejected with bad_signature "
+                      "until the SSM parameter loads — check SLACK_SIGNING_SECRET_PARAM")
             _SIGNING_SECRET = None
     return _SIGNING_SECRET
 
@@ -186,7 +189,11 @@ def handler(event: dict, context: object) -> dict:
         _log("INFO", "approve_invoked", decision=invoke_event["action"],
              run_date=invoke_event.get("run_date"), art_id=invoke_event.get("id"))
     except Exception as e:
-        _log("ERROR", "approve_invoke_failed", error=str(e))
+        _log("ERROR", "approve_invoke_failed",
+             err_type=type(e).__name__, err_msg=str(e)[:300],
+             hint="the Slack decision was ACKed but NOT applied — the user thinks "
+                  "it worked; re-apply from the console Review page or re-click. "
+                  "Check IAM lambda:InvokeFunction and APPROVE_FUNCTION_NAME.")
         return _ack(200, "received (processing delayed)", started)
 
     return _ack(200, "Working on it…", started)

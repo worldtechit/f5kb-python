@@ -241,3 +241,51 @@ def test_timeout_saves_progress_and_reinvokes(aws, monkeypatch):
     assert len(reinvoked) == 1
     assert store.exists(f"runs/{RUN_DATE}/track/progress.json")
     assert not store.exists(f"runs/{RUN_DATE}/track/_done")
+
+
+# ── batched writes (O(n^2) append regression) ─────────────────────────────────
+
+
+def test_changes_written_in_one_batch_per_type(aws, monkeypatch):
+    """A 600-article type must produce ONE changes.jsonl write, not 600 —
+    per-article append_jsonl re-uploads the whole growing file (O(n^2) bytes)
+    and made full-corpus track outlast the 900s Lambda limit forever."""
+    store = aws
+    _register(store, ["Policy"])
+    for i in range(600):
+        _stage(store, "Policy", f"K{i:05}", body="body " * 10)
+
+    writes = {"changes": 0}
+    orig = S3Storage.put_bytes
+
+    def counting(self, key, data, content_type="application/octet-stream"):
+        if key.endswith("track/changes.jsonl"):
+            writes["changes"] += 1
+        return orig(self, key, data, content_type)
+
+    monkeypatch.setattr(S3Storage, "put_bytes", counting)
+
+    from f5kb.handlers.track import handler
+    result = handler(_scrape_done_event(), None)
+
+    assert result["new"] == 600
+    assert len(_changes(store)) == 600
+    assert writes["changes"] == 1
+
+
+def test_fresh_start_resets_stale_partial_changes(aws):
+    """A prior invocation that died MID-type leaves partial changes.jsonl lines
+    with no progress checkpoint; a fresh start must reset the file, not append
+    duplicates on top."""
+    store = aws
+    _register(store, ["Policy"])
+    _stage(store, "Policy", "K001", body="body " * 20)
+    # stale partial from a crashed attempt (no progress.json)
+    store.append_jsonl(f"runs/{RUN_DATE}/track/changes.jsonl",
+                       {"id": "STALE", "type_key": "Policy", "op": "new"})
+
+    from f5kb.handlers.track import handler
+    handler(_scrape_done_event(), None)
+
+    ids = [r["id"] for r in _changes(store)]
+    assert ids == ["K001"]  # stale line gone, no duplicates

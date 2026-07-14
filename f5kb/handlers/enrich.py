@@ -34,12 +34,14 @@ import datetime
 import json
 import os
 import sys
+import time
 
 import boto3
 import httpx
 
 from f5kb.enrich.enrichers import STALE_KEYS, TYPE_ENRICHERS, has_body
 from f5kb.http.fetcher import HttpClient
+from f5kb.lib.logutil import exc_fields
 from f5kb.storage.s3 import S3Storage
 
 LAMBDA_NAME = "enrich"
@@ -58,7 +60,11 @@ def _get_github_token() -> str | None:
             _SECRET_CACHE[param] = _ssm.get_parameter(
                 Name=param, WithDecryption=True
             )["Parameter"]["Value"]
-        except Exception:
+        except Exception as e:
+            _log("WARN", "github_token_fetch_failed", param=param,
+                 err_type=type(e).__name__, err_msg=str(e)[:300],
+                 hint="F5_GitHub enrichment runs unauthenticated — GitHub API rate "
+                      "limit drops to 60/h; expect bodyError failures on large batches")
             return None
     val = _SECRET_CACHE.get(param, "")
     return val if val and not val.startswith("placeholder") else None
@@ -96,6 +102,18 @@ def _log(level: str, action: str, **fields: object) -> None:
 # ── handler ─────────────────────────────────────────────────────────────────
 
 def handler(event: dict, context: object) -> dict:
+    try:
+        return _handler(event, context)
+    except Exception as e:
+        _log("ERROR", "invocation_failed", **exc_fields(e),
+             hint="uncaught crash; SQS redelivers (maxReceiveCount 3, then enrich DLQ). "
+                  "Cursor at lambda/state/{run_date}/enrich-{type_key}.json shows the "
+                  "last checkpointed manifest offset.")
+        raise
+
+
+def _handler(event: dict, context: object) -> dict:
+    started_monotonic = time.monotonic()
     bucket = os.environ["BUCKET"]
     queue_url = os.environ["ENRICH_QUEUE_URL"]
     github_token = _get_github_token()
@@ -104,7 +122,14 @@ def handler(event: dict, context: object) -> dict:
 
     record = event["Records"][0]
     msg = json.loads(record["body"])
-    run_date, type_key, manifest_offset = _parse_message(msg)
+    try:
+        run_date, type_key, manifest_offset = _parse_message(msg)
+    except (ValueError, KeyError) as e:
+        _log("ERROR", "bad_message_shape", message_keys=sorted(msg),
+             **exc_fields(e),
+             hint="neither an EventBridge S3-event envelope nor a self-requeue cursor "
+                  "message — inspect the enrich DLQ for the raw body")
+        raise
 
     enricher = TYPE_ENRICHERS.get(type_key)
     if type_key not in ENRICHABLE or enricher is None:
@@ -131,7 +156,11 @@ def handler(event: dict, context: object) -> dict:
 
     _log("INFO", "enrich_started", run_date=run_date, type_key=type_key,
          manifest_offset=manifest_offset, total=total,
-         resumed=bool(cursor_state) or None)
+         resumed=bool(cursor_state) or None,
+         enriched_so_far=enriched or None, failed_so_far=failed or None,
+         skipped_so_far=skipped or None,
+         github_token_present=bool(github_token) if type_key == "Bug_Tracker" else None,
+         remaining_ms=_ms_remaining(context))
 
     http_client = httpx.Client(timeout=30.0)
     http = HttpClient(client=http_client)
@@ -178,6 +207,10 @@ def handler(event: dict, context: object) -> dict:
             try:
                 result = enricher(article, now_iso, http, github_token=github_token)
             except Exception as exc:
+                # Raised (vs returned bodyError) = unexpected — log the traceback
+                # so the failing enricher line is identifiable from the logs alone.
+                _log("WARN", "enricher_raised", run_date=run_date, type_key=type_key,
+                     id=art_id, link=article.get("link") or "", **exc_fields(exc))
                 result = {
                     "bodySource": article.get("link") or "",
                     "fetchedAt": now_iso,
@@ -193,7 +226,10 @@ def handler(event: dict, context: object) -> dict:
                 # There is no per-article retry, so every failure is final;
                 # `final` feeds the EnrichFailed metric filter in template.yaml.
                 _log("WARN", "article_enrich_failed", run_date=run_date,
-                     type_key=type_key, id=art_id, error=body_error, final=True)
+                     type_key=type_key, id=art_id, error=body_error, final=True,
+                     link=article.get("link") or "",
+                     hint="no per-article retry — if a live version exists this becomes "
+                          "a body-error HOLD at approve; fix the source page or reject")
             else:
                 enriched += 1
                 _log("INFO", "article_enriched", run_date=run_date, type_key=type_key,
@@ -211,6 +247,10 @@ def handler(event: dict, context: object) -> dict:
             if idx % CHECKPOINT_EVERY == 0:
                 _save_cursor(store, cursor_key, run_date, type_key, idx,
                              enriched, failed, skipped)
+                _log("INFO", "progress_checkpoint", run_date=run_date,
+                     type_key=type_key, manifest_offset=idx, total=total,
+                     enriched=enriched, failed=failed, skipped=skipped,
+                     remaining_ms=_ms_remaining(context))
     finally:
         http_client.close()
 
@@ -225,7 +265,9 @@ def handler(event: dict, context: object) -> dict:
     })
     store.put_marker(f"runs/{run_date}/enrich/{type_key}/_done")
     _log("INFO", "enrich_complete", run_date=run_date, type_key=type_key,
-         enriched=enriched, failed=failed, skipped=skipped, total=total)
+         enriched=enriched, failed=failed, skipped=skipped, total=total,
+         elapsed_ms=int((time.monotonic() - started_monotonic) * 1000),
+         next_step="terminal-gate check runs now; scrape/_done once every type is terminal")
 
     _check_and_write_scrape_done(store, run_date)
     store.delete(cursor_key)
@@ -329,13 +371,18 @@ def _check_and_write_scrape_done(store: S3Storage, run_date: str) -> None:
     types = orch.get("types", [])
     enrichable = set(orch.get("enrichable", []))
 
+    missing = []
     for t in types:
         if t in enrichable:
             terminal_key = f"runs/{run_date}/enrich/{t}/_done"
         else:
             terminal_key = f"runs/{run_date}/dump/{t}/_done"
         if not store.exists(terminal_key):
-            return  # not all terminal yet
+            missing.append(t)
+    if missing:
+        _log("INFO", "terminal_gate_pending", run_date=run_date,
+             done=len(types) - len(missing), total=len(types), waiting_on=missing)
+        return
 
     won = store.put_conditional(f"runs/{run_date}/scrape/_done", b"")
     if won:

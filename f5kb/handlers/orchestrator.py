@@ -32,6 +32,7 @@ import time
 
 import boto3
 
+from f5kb.lib.logutil import exc_fields
 from f5kb.storage.s3 import S3Storage
 
 LAMBDA_NAME = "f5kb-orchestrator"
@@ -89,6 +90,18 @@ def _log(level: str, action: str, **fields: object) -> None:
 
 
 def handler(event: dict, context: object) -> dict:
+    try:
+        return _handler(event, context)
+    except Exception as e:
+        _log("ERROR", "invocation_failed", **exc_fields(e),
+             hint="orchestrator crashed — TODAY'S RUN DID NOT START unless run_started "
+                  "was already logged. A sweep-abort RuntimeError means a PRIOR run "
+                  "could not be closed: resolve its holds (console Review page or "
+                  "approve Lambda auto_escalate), then re-trigger.")
+        raise
+
+
+def _handler(event: dict, context: object) -> dict:
     event = event or {}
     bucket = os.environ["BUCKET"]
     queue_url = os.environ["DUMP_QUEUE_URL"]
@@ -96,6 +109,8 @@ def handler(event: dict, context: object) -> dict:
     store = S3Storage(bucket)
 
     action = str(event.get("action", "") or "").strip().lower()
+    _log("INFO", "invocation_started", requested_action=action or "run",
+         event_keys=sorted(event) or None)
 
     # 1. ACTION ROUTING ───────────────────────────────────────────────────────
     if action == "sweep_only":
@@ -194,7 +209,9 @@ def _resolve_types(store: S3Storage) -> list[str]:
     source is present — never silently fall back to the 4 enrichable types."""
     raw_types = os.environ.get("TYPE_KEYS", "")
     if raw_types.strip():
-        return [t.strip() for t in raw_types.split(",") if t.strip()]
+        env_types = [t.strip() for t in raw_types.split(",") if t.strip()]
+        _log("INFO", "types_resolved", source="env:TYPE_KEYS", count=len(env_types))
+        return env_types
 
     try:
         cfg = store.get("lambda/config/types.json")
@@ -208,8 +225,11 @@ def _resolve_types(store: S3Storage) -> list[str]:
         if isinstance(cfg, dict) and cfg:
             types = list(cfg.keys())
     if not types:
-        _log("ERROR", "config_missing_type_keys")
+        _log("ERROR", "config_missing_type_keys",
+             hint="set the TYPE_KEYS template parameter or upload "
+                  "lambda/config/types.json (scripts/sync_lambda_config.py)")
         raise RuntimeError("TYPE_KEYS not set and lambda/config/types.json absent — misconfiguration")
+    _log("INFO", "types_resolved", source="s3:lambda/config/types.json", count=len(types))
     return list(types)
 
 
@@ -235,9 +255,11 @@ def _run_sweep(store: S3Storage, bucket: str, context: object, today: str | None
     _log("INFO", "sweep_started", today=today)
 
     run_dates = _list_prior_run_dates(store, today)
+    swept = 0
     for run_date in run_dates:
         if store.exists(f"runs/{run_date}/approve/_done"):
             continue
+        swept += 1
 
         held = _has_holds(store, run_date)
         has_track_done = store.exists(f"runs/{run_date}/track/_done")
@@ -256,6 +278,9 @@ def _run_sweep(store: S3Storage, bucket: str, context: object, today: str | None
                 raise RuntimeError(f"sweep: prior run {run_date} with holds could not be closed — aborting")
         elif has_track_done:
             # Case B: track finished but approve never ran, no holds → resume.
+            _log("INFO", "sweep_resumed_run", run_date=run_date,
+                 hint="prior run reached track/_done but approve never closed — "
+                      "invoking the Approve Lambda with action=resume")
             _invoke_approve(run_date, "resume")
             if not _poll_for_approve_done(store, run_date):
                 _publish_ops_alert(
@@ -270,7 +295,13 @@ def _run_sweep(store: S3Storage, bucket: str, context: object, today: str | None
                 f"Orchestrator sweep found prior run {run_date} dead mid-scrape "
                 "(no track/_done); marked failed. Today's run supersedes it."
             )
-            _log("INFO", "sweep_marked_failed", run_date=run_date)
+            _log("INFO", "sweep_marked_failed", run_date=run_date,
+                 hint="run died before track/_done (scrape never finished) — its "
+                      "pending/ staging remains; today's full run re-stages anything "
+                      "still changed, so no data is lost")
+
+    _log("INFO", "sweep_complete", today=today,
+         prior_runs=len(run_dates), open_runs_handled=swept)
 
 
 def _list_prior_run_dates(store: S3Storage, today: str | None) -> list[str]:
@@ -358,11 +389,18 @@ def _invoke_approve(run_date: str, action: str) -> None:
 def _poll_for_approve_done(store: S3Storage, run_date: str) -> bool:
     """Poll runs/{date}/approve/_done every 10s up to a 5-minute budget.
     Returns True once the marker appears, False if the budget elapses."""
-    deadline = time.monotonic() + _SWEEP_POLL_BUDGET_S
+    started = time.monotonic()
+    deadline = started + _SWEEP_POLL_BUDGET_S
     while True:
         if store.exists(f"runs/{run_date}/approve/_done"):
+            _log("INFO", "sweep_run_closed", run_date=run_date,
+                 waited_s=int(time.monotonic() - started))
             return True
         if time.monotonic() >= deadline:
+            _log("WARN", "sweep_poll_timeout", run_date=run_date,
+                 budget_s=_SWEEP_POLL_BUDGET_S,
+                 hint="approve/_done never appeared — check the approve Lambda's logs "
+                      "for this run_date (it was invoked async just before this poll)")
             return False
         time.sleep(_SWEEP_POLL_INTERVAL_S)
 

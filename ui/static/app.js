@@ -4,8 +4,8 @@
 import { api } from "/api.js";
 import { el, esc, html, modal, toast } from "/ui.js";
 import {
-  articlePage, corpusPage, docsPage, historyPage, opsPage, overviewPage,
-  reviewPage, runsPage,
+  articlePage, corpusPage, docsPage, historyPage, integrationsPage, opsPage,
+  overviewPage, reviewPage, runsPage,
 } from "/pages.js";
 
 const ICONS = {
@@ -16,6 +16,7 @@ const ICONS = {
   history: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15.5 14"/></svg>',
   ops: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" y1="8" x2="20" y2="8"/><line x1="4" y1="16" x2="20" y2="16"/><circle cx="9" cy="8" r="2" fill="var(--bg-raised)"/><circle cx="15" cy="16" r="2" fill="var(--bg-raised)"/></svg>',
   docs: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20V4H6.5A2.5 2.5 0 0 0 4 6.5v13z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H20v-2.5"/></svg>',
+  integrations: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="5" cy="12" r="2.5"/><circle cx="19" cy="6" r="2.5"/><circle cx="19" cy="18" r="2.5"/><line x1="7.2" y1="11" x2="16.8" y2="7"/><line x1="7.2" y1="13" x2="16.8" y2="17"/></svg>',
 };
 
 const NAV = [
@@ -25,6 +26,7 @@ const NAV = [
   { hash: "#/corpus", label: "Corpus", icon: "corpus", group: "Data" },
   { hash: "#/history", label: "History", icon: "history" },
   { hash: "#/ops", label: "Operations", icon: "ops", group: "Operate" },
+  { hash: "#/integrations", label: "Integrations", icon: "integrations" },
   { hash: "#/docs", label: "Playbook & Docs", icon: "docs" },
 ];
 
@@ -36,6 +38,7 @@ const ROUTES = [
   { re: /^#\/article\/([^/]+)\/([^/]+)$/, page: articlePage, crumb: "Corpus", nav: "#/corpus" },
   { re: /^#\/history(?:\/([^/]+))?$/, page: historyPage, crumb: "History", nav: "#/history" },
   { re: /^#\/ops$/, page: opsPage, crumb: "Operations", nav: "#/ops" },
+  { re: /^#\/integrations$/, page: integrationsPage, crumb: "Integrations", nav: "#/integrations" },
   { re: /^#\/docs(?:\/([^/]+))?$/, page: docsPage, crumb: "Playbook & Docs", nav: "#/docs" },
 ];
 
@@ -163,6 +166,36 @@ function setupTheme() {
   };
 }
 
+async function setupTargetSwitcher() {
+  let info;
+  try { info = await api.targets(); } catch (_) { return; }
+  if (!(info.targets || []).length) return;
+  const sel = el("select", "inp");
+  sel.id = "target-select";
+  sel.title = "Switch target. Only the target the server was started against " +
+              "keeps write access — switched-to targets are read-only.";
+  sel.style.width = "auto";
+  for (const t of info.targets) sel.append(new Option(t, t, false, t === info.current));
+  sel.onchange = async () => {
+    sel.disabled = true;
+    try {
+      const r = await api.switchTarget(sel.value);
+      state.cfg = await api.config();
+      applyBadge();
+      toast(`switched to ${r.target}` +
+            (r.forced_read_only ? " (read-only — writes stay on the startup target)" : ""));
+      route();
+    } catch (e) {
+      toast(`switch failed: ${e.message}`, true);
+      const cur = (await api.targets().catch(() => null)) || {};
+      if (cur.current) sel.value = cur.current;
+    }
+    sel.disabled = false;
+  };
+  const badge = document.getElementById("target-badge");
+  badge.parentElement.insertBefore(sel, badge);
+}
+
 async function init() {
   buildNav();
   setupTheme();
@@ -173,6 +206,7 @@ async function init() {
     toast("cannot reach the console API: " + e.message, true);
   }
   applyBadge();
+  setupTargetSwitcher();
   window.addEventListener("hashchange", route);
   await route();
 }

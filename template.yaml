@@ -139,6 +139,10 @@ Resources:
             NoncurrentVersionExpiration: {NoncurrentDays: 90}
           # Bucket-wide hygiene (§15): abandoned multipart uploads + expired
           # delete markers (versioned buckets accumulate both silently).
+          - Id: DeploymentsNoncurrent365
+            Status: Enabled
+            Prefix: deployments/
+            NoncurrentVersionExpiration: {NoncurrentDays: 365}
           - Id: BucketWideCleanup
             Status: Enabled
             Prefix: ""
@@ -300,7 +304,10 @@ Resources:
               - Sid: PipelineQueues
                 Effect: Allow
                 Action: [sqs:SendMessage, sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
-                Resource: [!GetAtt DumpQueue.Arn, !GetAtt EnrichQueue.Arn]
+                # DLQs included for the watchdog's stall auto-redrive (receive
+                # the dead resume message, re-send to the work queue, delete).
+                Resource: [!GetAtt DumpQueue.Arn, !GetAtt EnrichQueue.Arn,
+                           !GetAtt DumpDLQ.Arn, !GetAtt EnrichDLQ.Arn]
               # §21 #4 — Approve (2 batches), Restore, Watchdog, and OnFailure
               # destinations (destinations publish under the function role).
               - Sid: SnsPublish
@@ -619,10 +626,13 @@ Resources:
       BuildMethod: makefile
       BuildTarget: build-AppFunction
 
-  # Watchdog — hold-aware hung-run detection at 06:00 UTC (fix #11):
+  # Watchdog — hold-aware hung-run detection + stall auto-redrive (hourly):
   # approve/_done -> silent; no _done + holds -> INFO; no _done + no holds ->
   # page with stuck phase; status.json ABSENT entirely -> page "run never
-  # started" (v2.1 #25).
+  # started" (v2.1 #25). Stall auto-redrive: open run + stale cursor + empty
+  # work queue + DLQ message for that run -> re-send the dead resume message
+  # (capped at WATCHDOG_MAX_REDRIVES per message, then escalate-only).
+  # Holds digest emails stay once daily (06:00 pass); action alerts any hour.
   WatchdogFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -630,20 +640,23 @@ Resources:
       CodeUri:      f5kb/
       Handler:      f5kb.handlers.watchdog.handler
       Role:         !GetAtt LambdaRole.Arn
-      Description:  Hold-aware hung/absent-run detection; pages via ops-alerts
-      Timeout:      60
+      Description:  Hold-aware hung/absent-run detection + stall auto-redrive; pages via ops-alerts
+      Timeout:      120
       MemorySize:   256
       Environment:
         Variables:
           OPS_TOPIC_ARN:         !Ref OpsAlertsTopic
           APPROVE_FUNCTION_NAME: !Sub "f5kb-approve-${Stage}"   # stale-hold escalation
+          DUMP_QUEUE_URL:        !Ref DumpQueue
+          ENRICH_QUEUE_URL:      !Ref EnrichQueue
+          DUMP_DLQ_URL:          !Ref DumpDLQ
+          ENRICH_DLQ_URL:        !Ref EnrichDLQ
       Events:
         WatchdogCron:
           Type: ScheduleV2
           Properties:
             Name:                       !Sub "f5kb-watchdog-${Stage}"
-            ScheduleExpression:         "cron(0 6 * * ? *)"
-            ScheduleExpressionTimezone: UTC
+            ScheduleExpression:         "rate(1 hour)"   # hourly so a stalled type heals within the hour
             State:                      !Ref ScheduleState   # both schedules track ScheduleState (§28)
     Metadata:
       BuildMethod: makefile

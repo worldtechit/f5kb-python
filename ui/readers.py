@@ -23,8 +23,10 @@ import difflib
 import json
 import os
 import pathlib
+import re
+import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 
@@ -44,6 +46,36 @@ ALL_TYPES = [
 ENRICHABLE = {"Manual", "Release_Note", "Supplemental_Document", "Bug_Tracker"}
 
 HASH_INDEX_KEY = "hash-index/current.json.gz"
+
+# Every pipeline Lambda (log-group + fan-out order for the log viewer).
+LAMBDA_FNS = ["orchestrator", "dump", "enrich", "track", "approve", "restore",
+              "watchdog", "slack-ack"]
+
+# Lambda REPORT platform line, e.g.
+# "REPORT RequestId: … Duration: 123.45 ms Billed Duration: 124 ms
+#  Memory Size: 1024 MB Max Memory Used: 250 MB"
+_REPORT_RE = re.compile(
+    r"Duration: ([\d.]+) ms\s+Billed Duration: (\d+) ms\s+"
+    r"Memory Size: (\d+) MB\s+Max Memory Used: (\d+) MB")
+
+# us-east-2 x86 Lambda pricing (2026): $ per GB-second + $ per request.
+_LAMBDA_GBS_USD = 0.0000166667
+_LAMBDA_REQ_USD = 0.20 / 1_000_000
+
+
+def parse_report_line(msg: str) -> dict | None:
+    """Extract duration/memory numbers from a Lambda REPORT platform line."""
+    if not msg.startswith("REPORT "):
+        return None
+    m = _REPORT_RE.search(msg)
+    if not m:
+        return None
+    return {
+        "duration_ms": float(m.group(1)),
+        "billed_ms": int(m.group(2)),
+        "memory_mb": int(m.group(3)),
+        "max_memory_mb": int(m.group(4)),
+    }
 
 # Prefixes the generic /api/object endpoint may serve (read-only browse).
 BROWSABLE_PREFIXES = (
@@ -87,19 +119,54 @@ class _TTLCache:
 
     def __init__(self) -> None:
         self._data: dict[str, tuple[float, Any]] = {}
+        self._lock = threading.Lock()
+        self._inflight: set[str] = set()
 
     def get(self, key: str, ttl: float) -> Any | None:
-        hit = self._data.get(key)
+        with self._lock:
+            hit = self._data.get(key)
         if hit and (time.time() - hit[0]) < ttl:
             return hit[1]
         return None
 
     def put(self, key: str, value: Any) -> None:
-        self._data[key] = (time.time(), value)
+        with self._lock:
+            self._data[key] = (time.time(), value)
 
     def drop(self, prefix: str = "") -> None:
-        for k in [k for k in self._data if k.startswith(prefix)]:
-            self._data.pop(k, None)
+        with self._lock:
+            for k in [k for k in self._data if k.startswith(prefix)]:
+                self._data.pop(k, None)
+
+    def swr(self, key: str, ttl: float, loader: Callable[[], Any]) -> Any:
+        """Stale-while-revalidate: a fresh hit returns immediately; a stale hit
+        returns the stale value and refreshes in a background thread (one at a
+        time per key); only a cold miss blocks on the loader."""
+        now = time.time()
+        with self._lock:
+            hit = self._data.get(key)
+            if hit and (now - hit[0]) < ttl:
+                return hit[1]
+            start_refresh = hit is not None and key not in self._inflight
+            if start_refresh:
+                self._inflight.add(key)
+        if hit is not None:
+            if start_refresh:
+                threading.Thread(target=self._refresh, args=(key, loader),
+                                 daemon=True).start()
+            return hit[1]
+        value = loader()  # cold: block this one request
+        self.put(key, value)
+        return value
+
+    def _refresh(self, key: str, loader: Callable[[], Any]) -> None:
+        try:
+            self.put(key, loader())
+        except Exception:
+            pass  # keep serving the stale value; next stale hit retries
+        finally:
+            with self._lock:
+                self._inflight.discard(key)
 
 
 def parse_jsonl(text: str | None) -> list[dict]:
@@ -190,6 +257,24 @@ class Reader:
     def list_keys(self, prefix: str) -> list[str]:
         raise NotImplementedError
 
+    def get_json_many(self, keys: list[str]) -> dict[str, Any]:
+        """Fetch many keys concurrently; absent keys map to None."""
+        if not keys:
+            return {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(keys))) as ex:
+            return dict(zip(keys, ex.map(self.get_json, keys)))
+
+    def count_jsonl_lines(self, key: str) -> int:
+        """Line count of a (potentially multi-MB) JSONL object. Briefly cached:
+        it feeds live run-progress numbers, where a ~30s lag is fine and
+        re-downloading a run manifest on every poll is not."""
+
+        def load() -> int:
+            txt = self.read_text(key)
+            return sum(1 for ln in txt.splitlines() if ln.strip()) if txt else 0
+
+        return self.cache.swr(f"nlines:{key}", 30, load)
+
     # ── pipeline views ────────────────────────────────────────────────────────
     def list_run_dates(self, limit: int = 30) -> list[str]:
         keys = self.cache.get("run-dates", 15)
@@ -203,30 +288,35 @@ class Reader:
             self.cache.put("run-dates", keys)
         return keys[:limit]
 
+    def _list_article_keys(self, type_key: str) -> list[str]:
+        """Ground truth for one type straight from the store listing (slow on
+        S3 — subclasses may serve article_keys from a cheaper source, but this
+        stays the reference the refresh path counts from)."""
+        return [k for k in self.list_keys(f"live/{type_key}/") if k.endswith(".json")]
+
+    def _count_by_listing(self) -> dict[str, int]:
+        types = self.corpus_types()
+        if not types:
+            return {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(types))) as ex:
+            sizes = ex.map(lambda t: len(self._list_article_keys(t)), types)
+        return {t: n for t, n in zip(types, sizes) if n}
+
     def corpus_counts(self, refresh: bool = False) -> dict[str, int]:
-        ttl = 0 if refresh else 300
-        cached = self.cache.get("corpus", ttl)
-        if cached is not None:
-            return cached
-        counts: dict[str, int] = {}
-        for t in self.corpus_types():
-            n = sum(1 for k in self.article_keys(t) if k.endswith(".json"))
-            if n:
-                counts[t] = n
-        self.cache.put("corpus", counts)
-        return counts
+        if refresh:
+            self.cache.drop("articles:")
+            counts = self._count_by_listing()
+            self.cache.put("corpus", counts)
+            return counts
+        return self.cache.swr("corpus", 300, self._count_by_listing)
 
     def corpus_types(self) -> list[str]:
         return ALL_TYPES
 
     def article_keys(self, type_key: str) -> list[str]:
         """All live-article keys for a type (cached; potentially large)."""
-        ck = f"articles:{type_key}"
-        keys = self.cache.get(ck, 60)
-        if keys is None:
-            keys = [k for k in self.list_keys(f"live/{type_key}/") if k.endswith(".json")]
-            self.cache.put(ck, keys)
-        return keys
+        return self.cache.swr(f"articles:{type_key}", 60,
+                              lambda: self._list_article_keys(type_key))
 
     def article_id_from_key(self, key: str) -> str:
         return key.rsplit("/", 1)[-1][: -len(".json")]
@@ -261,8 +351,13 @@ class Reader:
         return [{"key": k, "ts": k.rsplit("/", 1)[-1].removesuffix(".json")}
                 for k in sorted(keys, reverse=True) if k.endswith(".json")]
 
+    def _list_pending_keys(self) -> list[str]:
+        return [k for k in self.list_keys("pending/") if k.endswith(".json")]
+
     def pending_entries(self, cap: int = 2000) -> dict:
-        keys = [k for k in self.list_keys("pending/") if k.endswith(".json")]
+        # During a run pending/ holds every staged article (tens of thousands of
+        # keys) — cache the listing so polling pages don't re-sweep the prefix.
+        keys = self.cache.swr("pending-keys", 60, self._list_pending_keys)
         entries = []
         for k in keys[:cap]:
             parts = k.split("/")
@@ -296,6 +391,41 @@ class Reader:
 
     def recent_errors(self, minutes: int = 1440) -> list[dict]:
         return []
+
+    def logs(self, fn: str = "all", minutes: int = 180, level: str = "all",
+             query: str = "", limit: int = 300) -> list[dict]:
+        return []
+
+    def pipeline_state(self) -> dict:
+        return {}
+
+    def integrations(self) -> dict:
+        return {}
+
+    def health_check(self) -> list[dict]:
+        return []
+
+    def cost_report(self, minutes: int = 1440) -> dict:
+        return {}
+
+    def redrive_dlq(self, queue: str, message_id: str | None = None) -> dict:
+        raise RuntimeError("DLQ redrive is only available on AWS targets")
+
+    def set_pipeline_enabled(self, enabled: bool) -> dict:
+        raise RuntimeError("pipeline controls are only available on AWS targets")
+
+    def purge_queues(self) -> dict:
+        raise RuntimeError("queue purge is only available on AWS targets")
+
+    def delete_run(self, run_date: str, include_pending: bool = False,
+                   dry_run: bool = True) -> dict:
+        raise RuntimeError("delete-run is not supported on this target")
+
+    def resolve_pending(self, action: str, items: list[dict], actor: str) -> dict:
+        raise RuntimeError("pending resolution is not supported on this target")
+
+    def resolve_pending_type(self, action: str, type_key: str, actor: str) -> dict:
+        raise RuntimeError("pending resolution is not supported on this target")
 
     # ── mutations (writable targets only) ─────────────────────────────────────
     def trigger_run(self, mode: str) -> dict:
@@ -358,11 +488,58 @@ class StoreReader(Reader):
             return False
 
     def hash_index_stats(self) -> dict:
-        try:
-            idx = self.store.load_hash_index(HASH_INDEX_KEY)
-        except Exception:
-            idx = {}
-        return {"present": bool(idx), "entries": len(idx), "key": HASH_INDEX_KEY}
+        # Reuse the cached parse — reloading the ~3MB gzip on every poll is
+        # exactly the kind of hot-path cost this cache exists to absorb.
+        ids = self._live_ids_by_type() or {}
+        entries = sum(len(v) for v in ids.values())
+        return {"present": bool(entries), "entries": entries, "key": HASH_INDEX_KEY}
+
+    # ── corpus via the hash index (one ~3MB GET, not 100+ LIST round-trips) ──
+    # Every promotion to live/ also writes its db_key ("<type_key> <id>") into
+    # hash-index/current.json.gz, so the index mirrors live/ exactly. Deriving
+    # counts and key lists from it replaces the paginated list_objects_v2 sweep
+    # over the whole corpus that made every Overview/Corpus load take ~30s.
+
+    def _live_ids_by_type(self) -> dict[str, list[str]] | None:
+        """Per-type live article ids parsed from the hash index; None when the
+        index is absent (fresh bucket / plain mirror) so callers fall back to
+        listing the store."""
+
+        def load() -> dict[str, list[str]]:
+            try:
+                idx = self.store.load_hash_index(HASH_INDEX_KEY)
+            except Exception:
+                idx = {}
+            out: dict[str, list[str]] = {}
+            for k in idx:
+                type_key, _, art_id = k.partition(" ")
+                if type_key and art_id:
+                    out.setdefault(type_key, []).append(art_id)
+            for ids in out.values():
+                ids.sort()
+            return out
+
+        ids = self.cache.swr("live-ids", 60, load)
+        return ids or None
+
+    def corpus_counts(self, refresh: bool = False) -> dict[str, int]:
+        if refresh:
+            # Ground truth on demand: re-list the store, then let the next
+            # index read pick up fresh data too.
+            self.cache.drop("live-ids")
+            return super().corpus_counts(refresh=True)
+        ids = self._live_ids_by_type()
+        if ids is not None:
+            known = self.corpus_types()
+            ordered = known + sorted(set(ids) - set(known))
+            return {t: len(ids[t]) for t in ordered if ids.get(t)}
+        return super().corpus_counts(refresh)
+
+    def article_keys(self, type_key: str) -> list[str]:
+        ids = self._live_ids_by_type()
+        if ids is not None:
+            return [self.live_key(type_key, i) for i in ids.get(type_key, [])]
+        return super().article_keys(type_key)
 
     # ── shared mutations: archive-before-overwrite + hash-index + audit ──────
     def _promote(self, type_key: str, art_id: str, article: dict, actor: str,
@@ -403,6 +580,8 @@ class StoreReader(Reader):
         })
         self.cache.drop("articles:")
         self.cache.drop("corpus")
+        self.cache.drop("live-ids")
+        self.cache.drop("pending-keys")
         return {"live_key": live_key, "displaced_to": displaced_to, "ts": rec["ts"]}
 
     def save_article(self, type_key: str, art_id: str, article: dict, actor: str) -> dict:
@@ -427,6 +606,180 @@ class StoreReader(Reader):
         res = self._promote(type_key, art_id, archived, actor, op="restored",
                             extra_audit={"restored_from": archive_key})
         return {"status": "restored", "restored_from": archive_key, **res}
+
+    # ── bulk-resolve pending staged articles (console-side, full protocol) ───
+    def resolve_pending(self, action: str, items: list[dict], actor: str) -> dict:
+        """Approve (promote to live) or reject (drop) pending staged articles
+        that are NOT held — held ones go through the Approve Lambda instead.
+        Approve follows the full protocol via _promote (archive-before-
+        overwrite + hash-index + audit). NOTE: no P2 handoff SNS message is
+        published — use backfill afterwards if P2 must receive these."""
+        if not self.writable:
+            raise RuntimeError("read-only")
+        done, missing, errors = 0, 0, 0
+        for it in items:
+            type_key = it.get("type_key") or ""
+            art_id = it.get("id") or ""
+            pkey = self.pending_key(type_key, art_id)
+            try:
+                pending = self.get_json(pkey)
+                if pending is None:
+                    missing += 1
+                    continue
+                if action == "approve":
+                    self._promote(type_key, art_id, pending, actor, op="approved")
+                    self.store.delete(pkey)
+                else:
+                    self.store.delete(pkey)
+                    self.store.append_jsonl(f"audit/{_month()}/decisions.jsonl", {
+                        "op": "rejected", "id": art_id, "type": type_key,
+                        "actor": actor, "source": "dashboard", "ts": now_iso(),
+                    })
+                done += 1
+            except Exception:
+                errors += 1
+        self.cache.drop("pending-keys")
+        self.cache.drop("live-ids")
+        self.cache.drop("corpus")
+        return {"status": action, "done": done, "missing": missing,
+                "errors": errors, "total": len(items)}
+
+    def _append_jsonl_many(self, key: str, entries: list[dict]) -> None:
+        """Batch JSONL append — one get + one put for N entries. The store's
+        per-entry append_jsonl would rewrite the whole file N times (O(n^2))."""
+        if not entries:
+            return
+        try:
+            existing = self.store.get_bytes(key).decode("utf-8")
+        except KeyError:
+            existing = ""
+        lines = "".join(json.dumps(e, separators=(",", ":")) + "\n" for e in entries)
+        self.store.put_bytes(key, (existing + lines).encode("utf-8"),
+                             content_type="application/x-ndjson")
+
+    def resolve_pending_type(self, action: str, type_key: str, actor: str) -> dict:
+        """Approve or reject EVERY pending article of one type.
+
+        Bulk-optimised: the hash index is loaded/saved ONCE and the audit files
+        appended ONCE — routing each article through _promote would rewrite the
+        ~3MB index and the audit JSONL per article. Same protocol otherwise:
+        archive-before-overwrite per article, hash-index update, audit trail.
+        Like resolve_pending, no P2 handoff SNS is published."""
+        if not self.writable:
+            raise RuntimeError("read-only")
+        keys = [k for k in self.list_keys(f"pending/{type_key}/") if k.endswith(".json")]
+        stamp = now_iso()
+        month = _month()
+        result = {"status": action, "type_key": type_key, "done": 0,
+                  "missing": 0, "errors": 0, "total": len(keys)}
+        if not keys:
+            return result
+
+        if action == "reject":
+            result["done"] = self.store.delete_many(keys)
+            self.store.append_jsonl(f"audit/{month}/decisions.jsonl", {
+                "op": "rejected_type", "type": type_key, "count": result["done"],
+                "actor": actor, "source": "dashboard", "ts": stamp,
+            })
+        else:
+            fs_stamp = stamp.replace(":", "-")
+            idx = self.store.load_hash_index(HASH_INDEX_KEY)
+
+            def promote(pkey: str) -> tuple[str, str | None, str | None]:
+                art_id = self.article_id_from_key(pkey)
+                try:
+                    art = self.store.get(pkey)
+                except KeyError:
+                    return ("missing", art_id, None)
+                try:
+                    live_key = self.live_key(type_key, art_id)
+                    try:
+                        current = self.store.get(live_key)
+                    except KeyError:
+                        current = None
+                    if current is not None:
+                        self.store.put(f"archive/{type_key}/{art_id}/{fs_stamp}.json", current)
+                    self.store.put(live_key, art)
+                    self.store.delete(pkey)
+                    h = art.get("metadata_hash") or sha256_obj(art.get("metadata") or {})
+                    return ("done", art_id, h)
+                except Exception:
+                    return ("error", art_id, None)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+                outcomes = list(ex.map(promote, keys))
+
+            changed_recs: list[dict] = []
+            for status, art_id, h in outcomes:
+                if status == "done" and art_id and h:
+                    result["done"] += 1
+                    idx[db_key(type_key, art_id)] = h
+                    changed_recs.append({
+                        "op": "approved", "id": art_id, "type": type_key,
+                        "s3_key": self.live_key(type_key, art_id),
+                        "approved_by": actor, "hash": h, "ts": stamp,
+                    })
+                elif status == "missing":
+                    result["missing"] += 1
+                else:
+                    result["errors"] += 1
+
+            self.store.save_hash_index(idx, HASH_INDEX_KEY)
+            self._append_jsonl_many(f"audit/{month}/changed_ids.jsonl", changed_recs)
+            self.store.append_jsonl(f"audit/{month}/decisions.jsonl", {
+                "op": "approved_type", "type": type_key, "count": result["done"],
+                "errors": result["errors"] or None, "actor": actor,
+                "source": "dashboard", "ts": stamp,
+            })
+
+        for prefix in ("pending-keys", "live-ids", "corpus", "articles:"):
+            self.cache.drop(prefix)
+        return result
+
+    # ── delete a run's data (never touches live/, archive/, audit/, hash-index) ──
+    def _run_delete_keys(self, run_date: str, include_pending: bool) -> dict[str, list[str]]:
+        """Collect exactly what a delete-run would remove, grouped for display."""
+        groups = {
+            "runs": self.list_keys(f"runs/{run_date}/"),
+            "state": self.list_keys(f"lambda/state/{run_date}/"),
+            "pending": [],
+        }
+        if include_pending:
+            # Only the pending articles THIS run staged (from its manifests),
+            # intersected with what still exists — pending/ is shared across runs.
+            staged: set[str] = set()
+            for t in self.corpus_types():
+                for row in parse_jsonl(self.read_text(f"runs/{run_date}/manifest/{t}.jsonl")):
+                    art_id = row.get("id")
+                    if art_id:
+                        staged.add(self.pending_key(row.get("type_key") or t, str(art_id)))
+            existing = set(self.cache.swr("pending-keys", 60, self._list_pending_keys))
+            groups["pending"] = sorted(staged & existing)
+        return groups
+
+    def delete_run(self, run_date: str, include_pending: bool = False,
+                   dry_run: bool = True, actor: str = "console") -> dict:
+        if not dry_run and not self.writable:
+            raise RuntimeError("read-only")
+        groups = self._run_delete_keys(run_date, include_pending)
+        counts = {g: len(keys) for g, keys in groups.items()}
+        total = sum(counts.values())
+        if dry_run:
+            return {"status": "dry_run", "run_date": run_date, "counts": counts,
+                    "total": total,
+                    "sample": [k for keys in groups.values() for k in keys[:5]][:15]}
+        allowed = (f"runs/{run_date}/", f"lambda/state/{run_date}/", "pending/")
+        keys = [k for keys in groups.values() for k in keys]
+        assert all(k.startswith(allowed) for k in keys), "refusing non-run-scoped key"
+        deleted = self.store.delete_many(keys)
+        self.store.append_jsonl(f"audit/{_month()}/decisions.jsonl", {
+            "op": "run_deleted", "run_date": run_date, "actor": actor,
+            "source": "dashboard", "counts": counts, "ts": now_iso(),
+        })
+        for prefix in ("run-dates", "pending-keys", "nlines:"):
+            self.cache.drop(prefix)
+        return {"status": "deleted", "run_date": run_date, "counts": counts,
+                "total": deleted}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -534,14 +887,6 @@ class CliOutputsReader(Reader):
             return []
         return sorted(p.name for p in self.dump.iterdir()
                       if p.is_dir() and not p.name.startswith("_"))
-
-    def article_keys(self, type_key: str) -> list[str]:
-        ck = f"articles:{type_key}"
-        keys = self.cache.get(ck, 60)
-        if keys is None:
-            keys = self.list_keys(f"live/{type_key}/")
-            self.cache.put(ck, keys)
-        return keys
 
     def exists(self, key: str) -> bool:
         p = self._resolve(key)
@@ -670,76 +1015,527 @@ class AwsReader(StoreReader):
     def corpus_types(self) -> list[str]:
         return ALL_TYPES
 
+    def _list_pending_keys(self) -> list[str]:
+        # pending/ can hold every staged article of a run. Type keys are
+        # canonical on AWS (the orchestrator fails hard on anything else), so
+        # fan the listing out per type instead of walking one sequential
+        # continuation-token chain over the whole prefix.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            parts = ex.map(lambda t: self.list_keys(f"pending/{t}/"), ALL_TYPES)
+        return sorted(k for keys in parts for k in keys if k.endswith(".json"))
+
+    def _queue_url(self, name: str) -> str:
+        url = self.cache.get(f"qurl:{name}", 3600)
+        if url is None:
+            url = self._sqs.get_queue_url(QueueName=name)["QueueUrl"]
+            self.cache.put(f"qurl:{name}", url)
+        return url
+
     def dlq_depths(self) -> dict[str, int]:
-        out: dict[str, int] = {}
-        for q in (f"f5kb-dump-dlq-{self.stage}", f"f5kb-enrich-dlq-{self.stage}",
-                  f"f5kb-dump-queue-{self.stage}", f"f5kb-enrich-queue-{self.stage}"):
+        names = [f"f5kb-dump-dlq-{self.stage}", f"f5kb-enrich-dlq-{self.stage}",
+                 f"f5kb-dump-queue-{self.stage}", f"f5kb-enrich-queue-{self.stage}"]
+
+        def depth(q: str) -> tuple[str, int]:
             try:
-                url = self._sqs.get_queue_url(QueueName=q)["QueueUrl"]
                 attrs = self._sqs.get_queue_attributes(
-                    QueueUrl=url, AttributeNames=["ApproximateNumberOfMessages"])
-                out[q] = int(attrs["Attributes"]["ApproximateNumberOfMessages"])
+                    QueueUrl=self._queue_url(q),
+                    AttributeNames=["ApproximateNumberOfMessages"])
+                return q, int(attrs["Attributes"]["ApproximateNumberOfMessages"])
             except Exception:
-                out[q] = -1  # unknown
-        return out
+                return q, -1  # unknown
+
+        def load() -> dict[str, int]:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+                return dict(ex.map(depth, names))
+
+        # Overview + run detail both read this on every poll — fetch the four
+        # queues concurrently and serve a briefly-cached value in between.
+        return self.cache.swr("dlq-depths", 8, load)
 
     def dlq_messages(self, queue: str) -> list[dict]:
         """Peek up to 10 DLQ messages WITHOUT consuming them. Receiving hides a
         message from other readers for ~5s (VisibilityTimeout); nothing is
-        deleted — redrive/inspection tooling still sees every message."""
+        deleted — redrive/inspection tooling still sees every message.
+
+        Uses LONG polling with retries: a short poll (WaitTimeSeconds=0) samples
+        only a subset of SQS servers and routinely returns nothing on a sparse
+        queue even when messages exist — the "1 message but click shows empty"
+        bug. Each retry also collects messages the previous receive hid, so a
+        few rounds gather the full (approximate) depth."""
         allowed = {f"f5kb-dump-dlq-{self.stage}", f"f5kb-enrich-dlq-{self.stage}"}
         if queue not in allowed:
             raise ValueError(f"not a DLQ of this stage: {queue}")
-        url = self._sqs.get_queue_url(QueueName=queue)["QueueUrl"]
-        resp = self._sqs.receive_message(
-            QueueUrl=url,
-            MaxNumberOfMessages=10,
-            WaitTimeSeconds=0,
-            VisibilityTimeout=5,
-            AttributeNames=["All"],
-        )
-        out: list[dict] = []
-        for m in resp.get("Messages", []):
-            raw = m.get("Body") or ""
-            try:
-                body: Any = json.loads(raw)
-            except (ValueError, TypeError):
-                body = raw
-            attrs = m.get("Attributes") or {}
-            sent_ms = int(attrs.get("SentTimestamp") or 0)
-            out.append({
-                "message_id": m.get("MessageId") or "",
-                "sent_at": (
-                    datetime.datetime.fromtimestamp(sent_ms / 1000, datetime.timezone.utc)
-                    .isoformat().replace("+00:00", "Z") if sent_ms else None
-                ),
-                "receive_count": int(attrs.get("ApproximateReceiveCount") or 0),
-                "body": body,
-            })
-        return out
+        url = self._queue_url(queue)
+        try:
+            attrs = self._sqs.get_queue_attributes(
+                QueueUrl=url, AttributeNames=["ApproximateNumberOfMessages"])
+            expected = int(attrs["Attributes"]["ApproximateNumberOfMessages"])
+        except Exception:
+            expected = 0
+        target = min(max(expected, 1), 10)
+
+        seen: dict[str, dict] = {}
+        for _ in range(4):
+            resp = self._sqs.receive_message(
+                QueueUrl=url,
+                MaxNumberOfMessages=10,
+                WaitTimeSeconds=2,
+                VisibilityTimeout=5,
+                AttributeNames=["All"],
+            )
+            for m in resp.get("Messages", []):
+                mid = m.get("MessageId") or ""
+                if mid in seen:
+                    continue
+                raw = m.get("Body") or ""
+                try:
+                    body: Any = json.loads(raw)
+                except (ValueError, TypeError):
+                    body = raw
+                mattrs = m.get("Attributes") or {}
+                sent_ms = int(mattrs.get("SentTimestamp") or 0)
+                seen[mid] = {
+                    "message_id": mid,
+                    "sent_at": (
+                        datetime.datetime.fromtimestamp(sent_ms / 1000, datetime.timezone.utc)
+                        .isoformat().replace("+00:00", "Z") if sent_ms else None
+                    ),
+                    "receive_count": int(mattrs.get("ApproximateReceiveCount") or 0),
+                    "body": body,
+                }
+            if len(seen) >= target:
+                break
+        return sorted(seen.values(), key=lambda m: m.get("sent_at") or "")
 
     def recent_errors(self, minutes: int = 1440) -> list[dict]:
         start = int((time.time() - minutes * 60) * 1000)
-        out: list[dict] = []
-        fns = ["orchestrator", "dump", "enrich", "track", "approve", "restore",
-               "watchdog", "slack-ack"]
-        for fn in fns:
+        fns = LAMBDA_FNS
+
+        def fetch(fn: str) -> list[dict]:
             lg = f"/aws/lambda/f5kb-{fn}-{self.stage}"
+            rows: list[dict] = []
             try:
                 resp = self._logs.filter_log_events(
                     logGroupName=lg, startTime=start,
                     filterPattern='{ $.level = "ERROR" }', limit=25)
-                for ev in resp.get("events", []):
-                    try:
-                        rec = json.loads(ev["message"])
-                    except json.JSONDecodeError:
-                        rec = {"msg": ev["message"]}
-                    rec["_lambda"] = fn
-                    out.append(rec)
             except Exception:
-                continue
+                return rows
+            for ev in resp.get("events", []):
+                try:
+                    rec = json.loads(ev["message"])
+                except json.JSONDecodeError:
+                    rec = {"msg": ev["message"]}
+                rec["_lambda"] = fn
+                rows.append(rec)
+            return rows
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(fns)) as ex:
+            out = [r for rows in ex.map(fetch, fns) for r in rows]
         out.sort(key=lambda r: r.get("ts", ""), reverse=True)
         return out[:100]
+
+    # ── full log viewer: all levels, all lambdas, filterable ─────────────────
+    def logs(self, fn: str = "all", minutes: int = 180, level: str = "all",
+             query: str = "", limit: int = 300) -> list[dict]:
+        start = int((time.time() - minutes * 60) * 1000)
+        fns = LAMBDA_FNS if fn in ("", "all") else [fn]
+        pattern = {"error": '{ $.level = "ERROR" }',
+                   "info": '{ $.level = "INFO" }'}.get(level)
+        per = limit if len(fns) == 1 else max(50, limit // len(fns))
+
+        def fetch(name: str) -> list[dict]:
+            lg = f"/aws/lambda/f5kb-{name}-{self.stage}"
+            rows: list[dict] = []
+            kwargs: dict[str, Any] = {"logGroupName": lg, "startTime": start,
+                                      "limit": min(per, 1000)}
+            if pattern:
+                kwargs["filterPattern"] = pattern
+            token = None
+            try:
+                while len(rows) < per:
+                    if token:
+                        kwargs["nextToken"] = token
+                    resp = self._logs.filter_log_events(**kwargs)
+                    for ev in resp.get("events", []):
+                        msg = (ev.get("message") or "").rstrip("\n")
+                        try:
+                            rec: dict | None = json.loads(msg)
+                            if not isinstance(rec, dict):
+                                rec = None
+                        except json.JSONDecodeError:
+                            rec = None
+                        ts_iso = datetime.datetime.fromtimestamp(
+                            (ev.get("timestamp") or 0) / 1000, datetime.timezone.utc
+                        ).isoformat().replace("+00:00", "Z")
+                        lvl = (rec or {}).get("level") or (
+                            "PLATFORM" if msg.split(" ", 1)[0].rstrip(":") in
+                            ("START", "END", "REPORT", "INIT_START", "INIT_REPORT") else "RAW")
+                        # Handlers log {"action": "article_staged", type_key, id, ...}
+                        # — compose a scannable one-liner from the useful fields.
+                        summary = (rec or {}).get("msg")
+                        if not summary and rec:
+                            bits = [str(rec[k]) for k in
+                                    ("action", "type_key", "id", "run_date", "err_msg", "reason")
+                                    if rec.get(k)]
+                            summary = " · ".join(bits)
+                        rows.append({
+                            "lambda": name,
+                            "ts": (rec or {}).get("ts") or ts_iso,
+                            "level": lvl,
+                            "msg": summary or msg[:400],
+                            "record": rec,
+                        })
+                    token = resp.get("nextToken")
+                    if not token:
+                        break
+            except Exception:
+                pass  # missing log group (never invoked) or IAM — just skip
+            return rows
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(fns)) as ex:
+            out = [r for rows in ex.map(fetch, fns) for r in rows]
+        if query:
+            q = query.lower()
+            out = [r for r in out
+                   if q in json.dumps(r.get("record") or r.get("msg"), default=str).lower()
+                   or q in (r.get("msg") or "").lower()]
+        out.sort(key=lambda r: r.get("ts", ""), reverse=True)
+        return out[:limit]
+
+    # ── pipeline controls: SQS trigger state + pause/resume/purge ────────────
+    def _trigger_mappings(self) -> list[dict]:
+        out: list[dict] = []
+        for fn in (f"f5kb-dump-{self.stage}", f"f5kb-enrich-{self.stage}"):
+            try:
+                ms = self._lambda.list_event_source_mappings(
+                    FunctionName=fn)["EventSourceMappings"]
+            except Exception:
+                ms = []
+            for m in ms:
+                out.append({"function": fn, "uuid": m.get("UUID", ""),
+                            "state": m.get("State", "?")})
+        return out
+
+    def pipeline_state(self) -> dict:
+        def load() -> dict:
+            triggers = self._trigger_mappings()
+            schedules = []
+            try:
+                import boto3
+                scheduler = boto3.client("scheduler", region_name=self.region)
+                for name in (f"f5kb-daily-{self.stage}", f"f5kb-watchdog-{self.stage}"):
+                    try:
+                        s = scheduler.get_schedule(Name=name)
+                        schedules.append({"name": name, "state": s.get("State", "?")})
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            paused = bool(triggers) and all(t["state"] != "Enabled" for t in triggers)
+            return {"triggers": triggers, "schedules": schedules, "paused": paused}
+        return self.cache.swr("pipeline-state", 10, load)
+
+    def set_pipeline_enabled(self, enabled: bool) -> dict:
+        if not self.writable:
+            raise RuntimeError("read-only")
+        touched = []
+        for m in self._trigger_mappings():
+            self._lambda.update_event_source_mapping(UUID=m["uuid"], Enabled=enabled)
+            touched.append(m["function"])
+        self.cache.drop("pipeline-state")
+        return {"status": "resumed" if enabled else "paused", "functions": touched}
+
+    def purge_queues(self) -> dict:
+        """Purge the WORK queues (never the DLQs — those are the evidence)."""
+        if not self.writable:
+            raise RuntimeError("read-only")
+        out: dict[str, str] = {}
+        for q in (f"f5kb-dump-queue-{self.stage}", f"f5kb-enrich-queue-{self.stage}"):
+            try:
+                self._sqs.purge_queue(QueueUrl=self._queue_url(q))
+                out[q] = "purged"
+            except Exception as e:
+                out[q] = f"error: {e}"  # PurgeQueueInProgress = purged <60s ago
+        self.cache.drop("dlq-depths")
+        return out
+
+    # ── integrations: SNS topics + subscriber queue health ───────────────────
+    def integrations(self) -> dict:
+        def queue_status(arn: str) -> dict:
+            name = arn.split(":")[-1]
+            try:
+                parts = arn.split(":")
+                url = f"https://sqs.{parts[3]}.amazonaws.com/{parts[4]}/{parts[5]}"
+                attrs = self._sqs.get_queue_attributes(
+                    QueueUrl=url,
+                    AttributeNames=["ApproximateNumberOfMessages",
+                                    "ApproximateNumberOfMessagesNotVisible",
+                                    "ApproximateNumberOfMessagesDelayed"])["Attributes"]
+                return {"name": name, "accessible": True,
+                        "visible": int(attrs["ApproximateNumberOfMessages"]),
+                        "in_flight": int(attrs["ApproximateNumberOfMessagesNotVisible"]),
+                        "delayed": int(attrs["ApproximateNumberOfMessagesDelayed"])}
+            except Exception:
+                return {"name": name, "accessible": False,
+                        "note": "cross-account or no access — depth unknown"}
+
+        def load() -> dict:
+            arns: list[str] = []
+            try:
+                token = None
+                while True:
+                    resp = self._sns.list_topics(**({"NextToken": token} if token else {}))
+                    arns += [t["TopicArn"] for t in resp.get("Topics", [])]
+                    token = resp.get("NextToken")
+                    if not token:
+                        break
+            except Exception:
+                arns = [self.handoff_topic]
+            mine = [a for a in arns if a.split(":")[-1].startswith("f5kb-")
+                    and a.endswith(f"-{self.stage}")]
+            topics = []
+            for arn in mine:
+                subs = []
+                try:
+                    raw = self._sns.list_subscriptions_by_topic(
+                        TopicArn=arn).get("Subscriptions", [])
+                except Exception:
+                    raw = []
+                for s in raw:
+                    entry: dict[str, Any] = {"protocol": s.get("Protocol"),
+                                             "endpoint": s.get("Endpoint"),
+                                             "subscription_arn": s.get("SubscriptionArn")}
+                    if s.get("Protocol") == "sqs" and s.get("Endpoint"):
+                        entry["queue"] = queue_status(s["Endpoint"])
+                    subs.append(entry)
+                topics.append({"name": arn.split(":")[-1], "arn": arn,
+                               "is_handoff": arn == self.handoff_topic,
+                               "subscriptions": subs})
+            last_handoff = None
+            for d in self.list_run_dates(10):
+                if self.exists(f"runs/{d}/approve/_done"):
+                    last_handoff = d
+                    break
+            return {"topics": topics, "handoff_topic": self.handoff_topic,
+                    "last_handoff_run": last_handoff}
+        return self.cache.swr("integrations", 20, load)
+
+    # ── DLQ redrive: DLQ message back onto its work queue ─────────────────────
+    def _dlq_work_map(self) -> dict[str, str]:
+        return {f"f5kb-dump-dlq-{self.stage}": f"f5kb-dump-queue-{self.stage}",
+                f"f5kb-enrich-dlq-{self.stage}": f"f5kb-enrich-queue-{self.stage}"}
+
+    def redrive_dlq(self, queue: str, message_id: str | None = None) -> dict:
+        """Move one (or every) DLQ message back to its work queue: send the
+        body to the work queue, then delete it from the DLQ. Fix the
+        underlying cause first — an unfixed message just returns after 3 more
+        failed deliveries."""
+        if not self.writable:
+            raise RuntimeError("read-only")
+        mapping = self._dlq_work_map()
+        if queue not in mapping:
+            raise ValueError(f"not a DLQ of this stage: {queue}")
+        src = self._queue_url(queue)
+        dst = self._queue_url(mapping[queue])
+        moved = 0
+        seen: set[str] = set()
+        for _ in range(6):
+            resp = self._sqs.receive_message(
+                QueueUrl=src, MaxNumberOfMessages=10, WaitTimeSeconds=1,
+                VisibilityTimeout=30)
+            msgs = resp.get("Messages", [])
+            if not msgs and moved:
+                break
+            for m in msgs:
+                mid = m.get("MessageId") or ""
+                if mid in seen:
+                    continue
+                seen.add(mid)
+                if message_id and mid != message_id:
+                    continue  # leave it; the 30s visibility timeout releases it
+                self._sqs.send_message(QueueUrl=dst, MessageBody=m.get("Body") or "")
+                self._sqs.delete_message(QueueUrl=src, ReceiptHandle=m["ReceiptHandle"])
+                moved += 1
+                if message_id:
+                    self.cache.drop("dlq-depths")
+                    return {"status": "redriven", "moved": 1,
+                            "queue": queue, "to": mapping[queue]}
+        self.cache.drop("dlq-depths")
+        if message_id and not moved:
+            return {"status": "not_found", "moved": 0, "queue": queue,
+                    "note": "message not received within the polling window — retry"}
+        return {"status": "redriven", "moved": moved,
+                "queue": queue, "to": mapping[queue]}
+
+    # ── delete-run also clears this run's DLQ debris ──────────────────────────
+    def _run_dlq_messages(self, run_date: str, delete: bool) -> int:
+        """Count (and optionally delete) DLQ messages whose body references
+        run_date. Non-matching messages are left to their visibility timeout."""
+        count = 0
+        for q in self._dlq_work_map():
+            try:
+                url = self._queue_url(q)
+            except Exception:
+                continue
+            seen: set[str] = set()
+            for _ in range(4):
+                resp = self._sqs.receive_message(
+                    QueueUrl=url, MaxNumberOfMessages=10, WaitTimeSeconds=1,
+                    VisibilityTimeout=15)
+                msgs = resp.get("Messages", [])
+                if not msgs:
+                    break
+                for m in msgs:
+                    mid = m.get("MessageId") or ""
+                    if mid in seen:
+                        continue
+                    seen.add(mid)
+                    try:
+                        body = json.loads(m.get("Body") or "")
+                    except (ValueError, TypeError):
+                        continue
+                    if isinstance(body, dict) and body.get("run_date") == run_date:
+                        count += 1
+                        if delete:
+                            self._sqs.delete_message(
+                                QueueUrl=url, ReceiptHandle=m["ReceiptHandle"])
+        if delete and count:
+            self.cache.drop("dlq-depths")
+        return count
+
+    def delete_run(self, run_date: str, include_pending: bool = False,
+                   dry_run: bool = True, actor: str = "console") -> dict:
+        res = super().delete_run(run_date, include_pending, dry_run, actor)
+        try:
+            res["dlq_messages"] = self._run_dlq_messages(run_date, delete=not dry_run)
+        except Exception:
+            res["dlq_messages"] = -1  # unknown — never block the delete on SQS
+        return res
+
+    # ── health checks ─────────────────────────────────────────────────────────
+    def health_check(self) -> list[dict]:
+        """Sequential end-to-end checks; each returns ok + timing + detail."""
+        coveo_cfg: dict[str, Any] = {}
+
+        def coveo_token() -> str:
+            from f5kb.coveo.aura import fetch_coveo_config
+            coveo_cfg["cfg"] = fetch_coveo_config()
+            return "guest token fetched from the Aura endpoint"
+
+        def coveo_query() -> str:
+            import httpx as _httpx
+
+            from f5kb.coveo.client import CoveoClient
+            if "cfg" not in coveo_cfg:
+                raise RuntimeError("skipped — token fetch failed")
+            with _httpx.Client(timeout=30.0) as http:
+                client = CoveoClient(coveo_cfg["cfg"], client=http)
+                data = client.post({"q": "", "numberOfResults": 1, "searchHub": "myF5"})
+            return f"search ok — {int(data.get('totalCount') or 0):,} documents indexed"
+
+        def bucket_read() -> str:
+            idx = self.store.load_hash_index(HASH_INDEX_KEY)
+            return f"{self.bucket} readable — hash index {len(idx):,} entries"
+
+        def queues() -> str:
+            depths = self.dlq_depths()
+            bad = [q for q, n in depths.items() if n < 0]
+            if bad:
+                raise RuntimeError(f"unreachable: {', '.join(bad)}")
+            return f"{len(depths)} queues reachable"
+
+        def lambdas() -> str:
+            missing = []
+            for f in LAMBDA_FNS:
+                name = f"f5kb-{f}-{self.stage}"
+                try:
+                    self._lambda.get_function_configuration(FunctionName=name)
+                except Exception:
+                    missing.append(name)
+            if missing:
+                raise RuntimeError("missing: " + ", ".join(missing))
+            return f"all {len(LAMBDA_FNS)} functions deployed"
+
+        checks = [
+            ("coveo token", coveo_token,
+             "my.f5.com Aura endpoint down or blocking — the pipeline cannot scrape"),
+            ("coveo search", coveo_query,
+             "token works but the search API failed — check Coveo org status"),
+            ("s3 bucket", bucket_read,
+             "bucket missing or IAM denies s3:GetObject — is this stage deployed?"),
+            ("sqs queues", queues,
+             "queue missing or IAM denies sqs:GetQueueAttributes — is this stage deployed?"),
+            ("lambda functions", lambdas,
+             "stack not deployed for this stage, or IAM denies lambda:GetFunctionConfiguration"),
+        ]
+        out = []
+        for name, fn, hint in checks:
+            t0 = time.monotonic()
+            try:
+                detail = fn()
+                out.append({"name": name, "ok": True,
+                            "ms": int((time.monotonic() - t0) * 1000), "detail": detail})
+            except Exception as e:
+                out.append({"name": name, "ok": False,
+                            "ms": int((time.monotonic() - t0) * 1000),
+                            "detail": f"{type(e).__name__}: {str(e)[:200]}", "hint": hint})
+        return out
+
+    # ── cost + duration from REPORT platform lines ────────────────────────────
+    def cost_report(self, minutes: int = 1440) -> dict:
+        def load() -> dict:
+            start = int((time.time() - minutes * 60) * 1000)
+
+            def fetch(fn: str) -> dict:
+                lg = f"/aws/lambda/f5kb-{fn}-{self.stage}"
+                agg = {"lambda": fn, "invocations": 0, "billed_ms": 0,
+                       "memory_mb": 0, "max_memory_mb": 0, "max_duration_ms": 0.0}
+                kwargs: dict[str, Any] = {"logGroupName": lg, "startTime": start,
+                                          "filterPattern": '"REPORT RequestId"',
+                                          "limit": 10000}
+                token = None
+                try:
+                    for _ in range(5):  # cap pages; 50k REPORT lines is plenty
+                        if token:
+                            kwargs["nextToken"] = token
+                        resp = self._logs.filter_log_events(**kwargs)
+                        for ev in resp.get("events", []):
+                            rec = parse_report_line(ev.get("message") or "")
+                            if not rec:
+                                continue
+                            agg["invocations"] += 1
+                            agg["billed_ms"] += rec["billed_ms"]
+                            agg["memory_mb"] = rec["memory_mb"]
+                            agg["max_memory_mb"] = max(agg["max_memory_mb"],
+                                                       rec["max_memory_mb"])
+                            agg["max_duration_ms"] = max(agg["max_duration_ms"],
+                                                         rec["duration_ms"])
+                        token = resp.get("nextToken")
+                        if not token:
+                            break
+                except Exception:
+                    pass  # missing log group = never invoked in the window
+                gb_s = (agg["billed_ms"] / 1000.0) * (agg["memory_mb"] / 1024.0)
+                agg["gb_seconds"] = round(gb_s, 1)
+                agg["est_usd"] = round(gb_s * _LAMBDA_GBS_USD
+                                       + agg["invocations"] * _LAMBDA_REQ_USD, 4)
+                return agg
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(LAMBDA_FNS)) as ex:
+                rows = [r for r in ex.map(fetch, LAMBDA_FNS)]
+            rows = [r for r in rows if r["invocations"]]
+            return {
+                "window_minutes": minutes,
+                "lambdas": sorted(rows, key=lambda r: -r["est_usd"]),
+                "totals": {
+                    "invocations": sum(r["invocations"] for r in rows),
+                    "gb_seconds": round(sum(r["gb_seconds"] for r in rows), 1),
+                    "est_usd": round(sum(r["est_usd"] for r in rows), 4),
+                },
+                "note": "compute only (x86 us-east-2 rates, before free tier); "
+                        "excludes S3/SQS/CloudWatch request costs",
+            }
+        return self.cache.swr(f"costs:{minutes}", 60, load)
 
     # ── writes (guarded by writable at the route layer too) ──────────────────
     def trigger_run(self, mode: str) -> dict:
@@ -823,6 +1619,11 @@ def page_articles(reader: Reader, type_key: str, query: str, page: int, size: in
         r["has_pending"] = (type_key, r["id"]) in pend
     return {"type_key": type_key, "total": total, "page": page, "pages": pages,
             "size": size, "rows": rows}
+
+
+def list_targets() -> list[str]:
+    cfg = yaml.safe_load((HERE / "config.yaml").read_text())
+    return list((cfg.get("targets") or {}).keys())
 
 
 def load_target(target: str, allow_writes: bool) -> Reader:

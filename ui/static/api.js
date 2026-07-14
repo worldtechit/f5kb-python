@@ -48,6 +48,14 @@ export const api = {
   dlqs: () => req("/api/dlqs"),
   dlqMessages: (queue) => req(`/api/dlq/${encodeURIComponent(queue)}/messages`),
   errors: (minutes = 1440) => req(`/api/errors?minutes=${minutes}`),
+  logs: (fn = "all", minutes = 180, level = "all", q = "", limit = 300) =>
+    req(`/api/logs?fn=${encodeURIComponent(fn)}&minutes=${minutes}` +
+        `&level=${encodeURIComponent(level)}&q=${encodeURIComponent(q)}&limit=${limit}`),
+  pipeline: () => req("/api/pipeline"),
+  integrations: () => req("/api/integrations"),
+  health: () => req("/api/health"),
+  costs: (minutes = 1440) => req(`/api/costs?minutes=${minutes}`),
+  targets: () => req("/api/targets"),
   docs: () => req("/api/docs"),
   doc: (name) => req(`/api/docs/${encodeURIComponent(name)}`),
 
@@ -56,4 +64,9 @@ export const api = {
   backfill: (payload) => api.post("/api/actions/backfill", payload),
   restore: (payload) => api.post("/api/actions/restore", payload),
   saveArticle: (payload) => api.post("/api/actions/save-article", payload),
+  pipelineAction: (action) => api.post("/api/actions/pipeline", { action }),
+  deleteRun: (payload) => api.post("/api/actions/delete-run", payload),
+  pendingAction: (payload) => api.post("/api/actions/pending", payload),
+  redrive: (payload) => api.post("/api/actions/redrive", payload),
+  switchTarget: (target) => api.post("/api/actions/switch-target", { target }),
 };

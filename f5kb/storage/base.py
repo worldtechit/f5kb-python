@@ -38,6 +38,12 @@ class StorageBackend(ABC):
     def delete(self, key: str) -> None:
         """Delete the object. No-op if it does not exist."""
 
+    def delete_many(self, keys: list[str]) -> int:
+        """Delete many keys; returns the count requested. Backends may batch."""
+        for k in keys:
+            self.delete(k)
+        return len(keys)
+
     @abstractmethod
     def list_prefix(self, prefix: str) -> list[str]:
         """Return all keys that begin with prefix. Full keys returned, sorted."""
@@ -63,6 +69,13 @@ class StorageBackend(ABC):
     @abstractmethod
     def append_jsonl(self, key: str, entry: dict) -> None:
         """Append one JSONL line to key. Single-writer assumption — get+append+put."""
+
+    def append_jsonl_many(self, key: str, entries: list[dict]) -> None:
+        """Append many JSONL lines in ONE write. Backends override — the naive
+        per-entry loop is O(n^2) bytes on S3 (each append re-uploads the whole
+        growing file; a full-corpus run pushes terabytes)."""
+        for e in entries:
+            self.append_jsonl(key, e)
 
     @abstractmethod
     def load_hash_index(self, key: str) -> dict[str, str]:

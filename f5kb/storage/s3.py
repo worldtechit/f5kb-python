@@ -84,6 +84,17 @@ class S3Storage(StorageBackend):
         # delete_object is idempotent — no error if key absent
         self._s3.delete_object(Bucket=self._bucket, Key=self._key(key))
 
+    def delete_many(self, keys: list[str]) -> int:
+        """Batch delete — up to 1000 keys per delete_objects call."""
+        for i in range(0, len(keys), 1000):
+            batch = keys[i:i + 1000]
+            self._s3.delete_objects(
+                Bucket=self._bucket,
+                Delete={"Objects": [{"Key": self._key(k)} for k in batch],
+                        "Quiet": True},
+            )
+        return len(keys)
+
     # ── Listing ──────────────────────────────────────────────────────────────
 
     def list_prefix(self, prefix: str) -> list[str]:
@@ -145,12 +156,20 @@ class S3Storage(StorageBackend):
 
     def append_jsonl(self, key: str, entry: dict) -> None:
         """Single-writer: get existing bytes + append line + put."""
+        self.append_jsonl_many(key, [entry])
+
+    def append_jsonl_many(self, key: str, entries: list[dict]) -> None:
+        """Batch append: ONE get + ONE put for N lines (vs N whole-file
+        rewrites — the O(n^2) pattern that stalled full-corpus runs)."""
+        if not entries:
+            return
         try:
             existing = self.get_bytes(key).decode("utf-8")
         except KeyError:
             existing = ""
-        line = json.dumps(entry, separators=(",", ":")) + "\n"
-        self.put_bytes(key, (existing + line).encode("utf-8"), content_type="application/x-ndjson")
+        lines = "".join(json.dumps(e, separators=(",", ":")) + "\n" for e in entries)
+        self.put_bytes(key, (existing + lines).encode("utf-8"),
+                       content_type="application/x-ndjson")
 
     # ── Hash index ───────────────────────────────────────────────────────────
 

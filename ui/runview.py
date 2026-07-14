@@ -17,16 +17,12 @@ data layout" + the handlers themselves):
 
 from __future__ import annotations
 
+import concurrent.futures
 from typing import Any
 
 from readers import ALL_TYPES, ENRICHABLE, Reader
 
 PHASES = ["scrape", "track", "approve", "done"]
-
-
-def _count_lines(reader: Reader, key: str) -> int:
-    txt = reader.read_text(key)
-    return sum(1 for ln in txt.splitlines() if ln.strip()) if txt else 0
 
 
 def run_summary(reader: Reader, date: str) -> dict:
@@ -44,23 +40,52 @@ def run_summary(reader: Reader, date: str) -> dict:
             "closed": done}
 
 
-def build_run_detail(reader: Reader, date: str) -> dict:
+def build_run_detail(reader: Reader, date: str) -> dict | None:
+    """Compose the run view; None when the run has no trace in the store
+    (deleted or never ran) — otherwise a bogus URL renders a ghost skeleton."""
     orch = reader.get_json(f"lambda/state/{date}/orchestrator.json") or {}
-    types = orch.get("types") or ALL_TYPES
-    enrichable = set(orch.get("enrichable") or (ENRICHABLE & set(types)))
-
     status = reader.get_json(f"runs/{date}/status.json") or {}
     done_keys = set(reader.list_keys(f"runs/{date}/"))
+    if not orch and not status and not done_keys:
+        return None
+
+    types = orch.get("types") or ALL_TYPES
+    enrichable = set(orch.get("enrichable") or (ENRICHABLE & set(types)))
 
     def has(k: str) -> bool:
         return f"runs/{date}/{k}" in done_keys
 
+    # One parallel batch for every per-type state file (4 keys x 13 types plus
+    # the run-level ones) — serially these small GETs dominated page latency.
+    fetched = reader.get_json_many(
+        [f"runs/{date}/dump/{t}/_index.json" for t in types]
+        + [f"runs/{date}/enrich/{t}/_report.json" for t in types]
+        + [f"lambda/state/{date}/dump-{t}.json" for t in types]
+        + [f"lambda/state/{date}/enrich-{t}.json" for t in types]
+        + [f"runs/{date}/track/summary.json",
+           f"runs/{date}/track/progress.json",
+           f"lambda/state/{date}/approve_held.json"])
+
+    # Manifests are only needed for types whose final index isn't written yet
+    # (i.e. still dumping); they grow to tens of thousands of lines, so fetch
+    # the few we need concurrently instead of one multi-MB GET per type.
+    need_manifest = [
+        t for t in types
+        if (fetched.get(f"runs/{date}/dump/{t}/_index.json") or {}).get("count_written") is None]
+    manifest_counts: dict[str, int] = {}
+    if need_manifest:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(need_manifest))) as ex:
+            counts = ex.map(
+                lambda t: reader.count_jsonl_lines(f"runs/{date}/manifest/{t}.jsonl"),
+                need_manifest)
+        manifest_counts = dict(zip(need_manifest, counts))
+
     per_type = []
     for t in types:
-        dump_idx = reader.get_json(f"runs/{date}/dump/{t}/_index.json") or {}
-        enrich_rep = reader.get_json(f"runs/{date}/enrich/{t}/_report.json") or {}
-        dump_cur = reader.get_json(f"lambda/state/{date}/dump-{t}.json") or {}
-        enrich_cur = reader.get_json(f"lambda/state/{date}/enrich-{t}.json") or {}
+        dump_idx = fetched.get(f"runs/{date}/dump/{t}/_index.json") or {}
+        enrich_rep = fetched.get(f"runs/{date}/enrich/{t}/_report.json") or {}
+        dump_cur = fetched.get(f"lambda/state/{date}/dump-{t}.json") or {}
+        enrich_cur = fetched.get(f"lambda/state/{date}/enrich-{t}.json") or {}
         is_enrich = t in enrichable
         dump_done = has(f"dump/{t}/_done")
         enrich_done = has(f"enrich/{t}/_done")
@@ -70,7 +95,7 @@ def build_run_detail(reader: Reader, date: str) -> dict:
         # else the resume cursor.
         staged = dump_idx.get("count_written")
         if staged is None:
-            staged = _count_lines(reader, f"runs/{date}/manifest/{t}.jsonl") or dump_cur.get("written", 0)
+            staged = manifest_counts.get(t, 0) or dump_cur.get("written", 0)
         server_total = dump_idx.get("count_server") or dump_cur.get("count_server") or 0
 
         if terminal:
@@ -103,8 +128,8 @@ def build_run_detail(reader: Reader, date: str) -> dict:
         })
 
     # Track: final summary if written, else the live progress counters.
-    track = reader.get_json(f"runs/{date}/track/summary.json") or {}
-    progress = reader.get_json(f"runs/{date}/track/progress.json") or {}
+    track = fetched.get(f"runs/{date}/track/summary.json") or {}
+    progress = fetched.get(f"runs/{date}/track/progress.json") or {}
     risk = track.get("risk_breakdown") or progress.get("counts") or {}
     track_view = {
         "new": track.get("new", progress.get("counts", {}).get("new", 0)),
@@ -115,7 +140,7 @@ def build_run_detail(reader: Reader, date: str) -> dict:
         "body_error": risk.get("body_error", 0),
     }
 
-    held = reader.get_json(f"lambda/state/{date}/approve_held.json") or {}
+    held = fetched.get(f"lambda/state/{date}/approve_held.json") or {}
     held_entries = held.get("entries") or []
 
     markers = {
@@ -179,8 +204,8 @@ def build_run_detail(reader: Reader, date: str) -> dict:
         "queues": dlqs,
         "track": track_view,
         "approve": {
-            "auto": _count_lines(reader, f"runs/{date}/approve/changed_ids.jsonl"),
-            "holds": _count_lines(reader, f"runs/{date}/approve/changed_ids-holds.jsonl"),
+            "auto": reader.count_jsonl_lines(f"runs/{date}/approve/changed_ids.jsonl"),
+            "holds": reader.count_jsonl_lines(f"runs/{date}/approve/changed_ids-holds.jsonl"),
         },
         "held": [
             {"id": e.get("id"), "type_key": e.get("type_key"),
