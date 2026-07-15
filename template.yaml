@@ -1,0 +1,1227 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  f5kb pipeline (cloud-red P1) — implements master reference v2.1.
+  EventBridge cron -> Orchestrator (step-zero sweep) -> Dump x13 (SQS) -> Enrich (SQS)
+  -> terminal gate scrape/_done -> Track -> Approve (Gate 1) -> SNS handoff -> WTIT.
+  Consumer queue lives in WTIT's stack (fix #3). No VPC, no RDS (fix #1).
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Parameters — the full §28 set. Same template deploys prod and nonprod;
+# only samconfig.toml values differ.
+# ──────────────────────────────────────────────────────────────────────────────
+Parameters:
+  Stage:
+    Type: String
+    Default: staging
+    AllowedValues: [prod, staging]
+    Description: Suffixes every resource name (§28).
+
+  ScheduleState:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: >
+      Applies to BOTH schedules (02:00 daily cron + 06:00 watchdog).
+      Non-prod runs are manual — DISABLED (§28).
+
+  TypeKeys:
+    Type: String
+    Default: "Support_Solution,Known_Issue,Knowledge,Security_Advisory,Video,Policy,Operations_Guide,Compliance,Education,Manual,Release_Note,Supplemental_Document,Bug_Tracker"
+    Description: >
+      Canonical comma-separated type keys (§5). Orchestrator FAILS HARD if empty
+      and no lambda/config/types.json exists (fix #13). Non-prod uses
+      "Policy,Compliance" (§28).
+
+  LogLevel:
+    Type: String
+    Default: DEBUG
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+    Description: Both stages ship DEBUG (§16).
+
+  OpsAlertEmail:
+    Type: String
+    Description: Email subscribed to f5kb-ops-alerts (watchdog pages, OnFailure, alarms).
+
+  ConsumerReadArns:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >
+      IAM role ARNs of downstream consumers (WTIT ingest role) granted read-only
+      s3:GetObject on live/*, runs/*, changelogs/* via bucket policy (v2.1 #24).
+      Leave empty until the WTIT handshake delivers the ARN — the policy is then
+      omitted and same-account testing still works.
+
+Conditions:
+  HasConsumerReadArns:
+    !Not [!Equals [!Join [",", !Ref ConsumerReadArns], ""]]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Globals — python3.12, X-Ray on all 8 functions (v2.1), shared env.
+# Timeout/Memory are set PER FUNCTION to match §20 exactly.
+# Secrets NEVER appear in env vars — only SSM parameter NAMES (fix #18).
+# ──────────────────────────────────────────────────────────────────────────────
+Globals:
+  Function:
+    Runtime: python3.12
+    Tracing: Active
+    Layers:
+      - !Ref DepsLayer
+    Environment:
+      Variables:
+        BUCKET:         !Ref ArticlesBucket
+        HASH_INDEX_KEY: hash-index/current.json.gz
+        PYTHONPATH:     /opt/python
+        LOG_LEVEL:      !Ref LogLevel
+
+Resources:
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # STORAGE — §14 schema, §15 versioning + lifecycle
+  # ════════════════════════════════════════════════════════════════════════════
+  ArticlesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "f5kb-articles-${AWS::AccountId}-${Stage}"
+      # Bucket-level versioning ON (fix #9 — per-prefix versioning does not exist).
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # S3 -> EventBridge: rule patterns need mid-path wildcards that native
+      # S3 notifications' prefix+suffix filters cannot express (§15).
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      # §15 table: current-version retention + noncurrent-version expiration.
+      # Without noncurrent rules, hot-rewrite keys (status.json, cursors, hash
+      # index) pile up unbounded invisible versions.
+      LifecycleConfiguration:
+        Rules:
+          - Id: LiveNoncurrent365
+            Status: Enabled
+            Prefix: live/
+            NoncurrentVersionExpiration: {NoncurrentDays: 365}
+          - Id: Archive365Noncurrent30
+            Status: Enabled
+            Prefix: archive/
+            ExpirationInDays: 365
+            NoncurrentVersionExpiration: {NoncurrentDays: 30}
+          - Id: Pending30Noncurrent7
+            Status: Enabled
+            Prefix: pending/
+            ExpirationInDays: 30
+            NoncurrentVersionExpiration: {NoncurrentDays: 7}
+          - Id: Runs90Noncurrent7
+            Status: Enabled
+            Prefix: runs/
+            ExpirationInDays: 90
+            NoncurrentVersionExpiration: {NoncurrentDays: 7}
+          - Id: LambdaState7Noncurrent1
+            Status: Enabled
+            Prefix: lambda/state/
+            ExpirationInDays: 7
+            NoncurrentVersionExpiration: {NoncurrentDays: 1}
+          - Id: HashIndexNoncurrent30
+            Status: Enabled
+            Prefix: hash-index/
+            NoncurrentVersionExpiration: {NoncurrentDays: 30}
+          - Id: AuditNoncurrent90
+            Status: Enabled
+            Prefix: audit/
+            NoncurrentVersionExpiration: {NoncurrentDays: 90}
+          - Id: ChangelogsNoncurrent90
+            Status: Enabled
+            Prefix: changelogs/
+            NoncurrentVersionExpiration: {NoncurrentDays: 90}
+          # Bucket-wide hygiene (§15): abandoned multipart uploads + expired
+          # delete markers (versioned buckets accumulate both silently).
+          - Id: DeploymentsNoncurrent365
+            Status: Enabled
+            Prefix: deployments/
+            NoncurrentVersionExpiration: {NoncurrentDays: 365}
+          - Id: BucketWideCleanup
+            Status: Enabled
+            Prefix: ""
+            AbortIncompleteMultipartUpload: {DaysAfterInitiation: 7}
+            ExpiredObjectDeleteMarker: true
+
+  # Consumer content-read grant (v2.1 #24). The SNS handoff carries S3 KEYS —
+  # a cross-account consumer cannot GetObject them without this. Read-only,
+  # scoped to the three prefixes a consumer legitimately needs: never pending/,
+  # audit/, or lambda/state/ (§11 step 4). Created only once ConsumerReadArns
+  # is supplied (post WTIT handshake).
+  ArticlesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: HasConsumerReadArns
+    Properties:
+      Bucket: !Ref ArticlesBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ConsumerReadOnly
+            Effect: Allow
+            Principal:
+              AWS: !Ref ConsumerReadArns
+            Action: s3:GetObject
+            Resource:
+              - !Sub "arn:aws:s3:::f5kb-articles-${AWS::AccountId}-${Stage}/live/*"
+              - !Sub "arn:aws:s3:::f5kb-articles-${AWS::AccountId}-${Stage}/runs/*"
+              - !Sub "arn:aws:s3:::f5kb-articles-${AWS::AccountId}-${Stage}/changelogs/*"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # MESSAGING — §19. Visibility = 5400s = 6 × 900s Lambda timeout on every
+  # queue (fix #14); maxReceiveCount 3 explicit in every redrive policy.
+  # NO P2 queue here — consumer owns the queue, in WTIT's stack (fix #3).
+  # ════════════════════════════════════════════════════════════════════════════
+  DumpDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "f5kb-dump-dlq-${Stage}"
+      MessageRetentionPeriod: 1209600   # 14 days
+
+  DumpQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "f5kb-dump-queue-${Stage}"
+      VisibilityTimeout: 5400           # 6 x 900s (fix #14)
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DumpDLQ.Arn
+        maxReceiveCount: 3
+
+  EnrichDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "f5kb-enrich-dlq-${Stage}"
+      MessageRetentionPeriod: 1209600   # 14 days
+
+  # Enrich moved behind SQS (fix #7): retry/DLQ/cursor parity with Dump.
+  # v1's direct EventBridge->Lambda async invokes died unrecoverably.
+  EnrichQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "f5kb-enrich-queue-${Stage}"
+      VisibilityTimeout: 5400           # 6 x 900s (fix #14)
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt EnrichDLQ.Arn
+        maxReceiveCount: 3
+
+  # EventBridge cannot target a queue without this (§19).
+  EnrichQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref EnrichQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowEventBridgeEnrichRule
+            Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: sqs:SendMessage
+            Resource: !GetAtt EnrichQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt EnrichRule.Arn
+
+  # The P2 trigger (§11): Approve/Restore publish here; every consumer
+  # subscribes its OWN queue (raw delivery). Adding a consumer = a
+  # subscription, not a code change. Subscriptions are created via CLI after
+  # the ARN handshake (§23 post-deploy step 3).
+  HandoffTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "f5kb-handoff-${Stage}"
+
+  # All P1 alerting lands here (§18): watchdog pages, OnFailure destinations,
+  # alarm actions.
+  OpsAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "f5kb-ops-alerts-${Stage}"
+
+  OpsAlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref OpsAlertsTopic
+      Protocol: email
+      Endpoint: !Ref OpsAlertEmail   # confirm the emailed link post-deploy (§23)
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # LAYER — deps from uv lockfile (unchanged from v1 build system)
+  # ════════════════════════════════════════════════════════════════════════════
+  DepsLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName:          !Sub "f5kb-deps-${Stage}"
+      ContentUri:         layer/
+      CompatibleRuntimes: [python3.12]
+      RetentionPolicy:    Delete
+    Metadata:
+      BuildMethod: makefile
+      BuildTarget: build-DepsLayer
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # IAM — §21, the nine statements. One shared execution role (known tradeoff;
+  # SlackAck split-role is the first hardening step if security review asks).
+  # Explicitly ABSENT on purpose: any WTIT queue permission, s3:CopyObject
+  # (not a real action — copy authorizes as Get+Put), VPC/RDS, runtime
+  # sns:Subscribe, consumer bucket reads (bucket policy's job).
+  # ════════════════════════════════════════════════════════════════════════════
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "f5kb-lambda-role-${Stage}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole   # §21 #8
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess                   # §21 #9
+      Policies:
+        - PolicyName: f5kb-pipeline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # §21 #1 — reads, writes, promotes (copy = Get + Put);
+              # conditional PUTs (If-None-Match) need only PutObject.
+              - Sid: S3Objects
+                Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource: !Sub "arn:aws:s3:::f5kb-articles-${AWS::AccountId}-${Stage}/*"
+              # §21 #2 — terminal-gate _done listing, manifests, sweep, watchdog.
+              - Sid: S3List
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::f5kb-articles-${AWS::AccountId}-${Stage}"
+              # §21 #3 — Orchestrator fan-out; Dump/Enrich ESMs run under this
+              # role; self-re-queue on timeout (§8).
+              - Sid: PipelineQueues
+                Effect: Allow
+                Action: [sqs:SendMessage, sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+                # DLQs included for the watchdog's stall auto-redrive (receive
+                # the dead resume message, re-send to the work queue, delete).
+                Resource: [!GetAtt DumpQueue.Arn, !GetAtt EnrichQueue.Arn,
+                           !GetAtt DumpDLQ.Arn, !GetAtt EnrichDLQ.Arn]
+              # §21 #4 — Approve (2 batches), Restore, Watchdog, and OnFailure
+              # destinations (destinations publish under the function role).
+              - Sid: SnsPublish
+                Effect: Allow
+                Action: sns:Publish
+                Resource: [!Ref HandoffTopic, !Ref OpsAlertsTopic]
+              # §21 #5 — SlackAck->Approve, sweep->Approve, Approve->itself,
+              # Track->itself. Scoped to the two ARNs, NOT "*". Built as
+              # strings (names are deterministic) to avoid a circular
+              # role<->function dependency.
+              - Sid: SelfInvoke
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:f5kb-approve-${Stage}"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:f5kb-track-${Stage}"
+              # §21 #6 — Approve (webhook), SlackAck (signing secret), Enrich
+              # (optional GitHub token). SecureStrings are created PRE-DEPLOY
+              # via CLI — CloudFormation cannot create them (fix #18, §23).
+              - Sid: SsmSecrets
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/f5kb/${Stage}/*"
+              # §21 #7 — SecureString decryption rides GetParameter. Scoped to
+              # KMS use via SSM only (the aws/ssm managed key path).
+              - Sid: SsmKmsDecrypt
+                Effect: Allow
+                Action: kms:Decrypt
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub "ssm.${AWS::Region}.amazonaws.com"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # COMPUTE — §20 config table, exactly. All 8 functions: Tracing Active.
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # Orchestrator — 900s (v2.1 #22: the step-zero sweep is BLOCKING; it may
+  # wait ~5 min on the prior run's closure before fanning out).
+  OrchestratorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "f5kb-orchestrator-${Stage}"
+      CodeUri:      f5kb/
+      Handler:      f5kb.handlers.orchestrator.handler
+      Role:         !GetAtt LambdaRole.Arn
+      Description:  Step-zero sweep (blocking) + per-type SQS fan-out; fails hard if TYPE_KEYS missing
+      Timeout:      900
+      MemorySize:   512
+      Environment:
+        Variables:
+          TYPE_KEYS:             !Ref TypeKeys       # fail-hard if empty (fix #13)
+          DUMP_QUEUE_URL:        !Ref DumpQueue
+          APPROVE_FUNCTION_NAME: !Sub "f5kb-approve-${Stage}"   # sweep escalation target (§4)
+          OPS_TOPIC_ARN:         !Ref OpsAlertsTopic             # sweep abort alerts
+      # Async invoke deaths (Scheduler) otherwise evaporate after 2 retries (§18).
+      EventInvokeConfig:
+        DestinationConfig:
+          OnFailure:
+            Type: SNS
+            Destination: !Ref OpsAlertsTopic
+      Events:
+        DailyCron:
+          Type: ScheduleV2
+          Properties:
+            Name:                       !Sub "f5kb-daily-${Stage}"
+            ScheduleExpression:         "cron(0 2 * * ? *)"
+            ScheduleExpressionTimezone: UTC
+            State:                      !Ref ScheduleState   # DISABLED in nonprod (§28)
+    Metadata:
+      BuildMethod: makefile
+      BuildTarget: build-AppFunction
+
+  # Dump — 13 parallel (one type per SQS message); @rowid keyset in BOTH
+  # modes (fix #12); cursor + re-queue on timeout (§8); terminal-gate check
+  # + conditional-PUT scrape/_done race (fix #21, §10).
+  DumpFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "f5kb-dump-${Stage}"
+      CodeUri:      f5kb/
+      Handler:      f5kb.handlers.dump.handler
+      Role:         !GetAtt LambdaRole.Arn
+      Description:  Coveo keyset scraper; per-type manifests; terminal-gate check
+      Timeout:      900
+      MemorySize:   1024   # loads the ~3MB gz hash index (~106k entries inflated)
+      Environment:
+        Variables:
+          DUMP_QUEUE_URL: !Ref DumpQueue   # self-re-queue on timeout (§8)
+          PAGE_SIZE:      "100"            # 500 exceeds Coveo's 20MB response cap on large-body types
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue:     !GetAtt DumpQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes: [ReportBatchItemFailures]
+    Metadata:
+      BuildMethod: makefile
+      BuildTarget: build-AppFunction
+
+  # Enrich — SQS-driven (fix #7), MaximumConcurrency 5 (F5 CDN etiquette —
+  # confirm against local worker-pool size, §27 item 6). Handler must parse
+  # TWO message shapes: the EventBridge envelope AND its own re-queue
+  # cursor message (v2.1 #26).
+  EnrichFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "f5kb-enrich-${Stage}"
+      CodeUri:      f5kb/
+      Handler:      f5kb.handlers.enrich.handler
+      Role:         !GetAtt LambdaRole.Arn
+      Description:  HTTP body fetch for the 4 enrichable types; cursor + re-queue; terminal-gate check
+      Timeout:      900
+      MemorySize:   1024
+      Environment:
+        Variables:
+          ENRICH_QUEUE_URL:   !Ref EnrichQueue   # self-re-queue on timeout (§8)
+          # Optional; F5_GitHub type is excluded anyway (§5). SSM name, not a secret.
+          GITHUB_TOKEN_PARAM: !Sub "/f5kb/${Stage}/github/token"
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue:     !GetAtt EnrichQueue.Arn
+            BatchSize: 1
+            ScalingConfig:
+              MaximumConcurrency: 5   # §20; minimum AWS allows is 2 (§31 #8)
+            FunctionResponseTypes: [ReportBatchItemFailures]
+    Metadata:
+      BuildMethod: makefile
+      BuildTarget: build-AppFunction
+
+  # Track — 900s + self-reinvoke (fix #7; v1's 300s died at day-0 scale).
+  TrackFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "f5kb-track-${Stage}"
+      CodeUri:      f5kb/
+      Handler:      f5kb.handlers.track.handler
+      Role:         !GetAtt LambdaRole.Arn
+      Description:  Hash diff + risk flags; self-reinvokes near timeout; writes track/_done
+      Timeout:      900
+      MemorySize:   1024
+      EventInvokeConfig:
+        DestinationConfig:
+          OnFailure:
+            Type: SNS
+            Destination: !Ref OpsAlertsTopic
+    Metadata:
+      BuildMethod: makefile
+      BuildTarget: build-AppFunction
+
+  TrackInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt TrackFunction.Arn
+      Action:       lambda:InvokeFunction
+      Principal:    events.amazonaws.com
+      SourceArn:    !GetAtt TrackRule.Arn
+
+  # Track fires on the TERMINAL GATE — runs/*/scrape/_done, written by the
+  # last finisher (Dump OR Enrich) via conditional PUT (fix #21). v1 watched
+  # enrich/_done and shipped partial runs when a slow NON-enrichable type
+  # (Support_Solution, the largest) was still dumping.
+  TrackRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name:         !Sub "f5kb-track-trigger-${Stage}"
+      Description:  Fires when ALL 13 types are terminal (scrape/_done)
+      EventBusName: default
+      EventPattern:
+        source: ["aws.s3"]
+        detail-type: ["Object Created"]
+        detail:
+          bucket:
+            name: [!Ref ArticlesBucket]
+          object:
+            key:
+              - suffix: "/scrape/_done"
+      State: ENABLED
+      Targets:
+        - Id:  TrackTarget
+          Arn: !GetAtt TrackFunction.Arn
+
+  # Approve — Gate 1. Reserved concurrency 1 serializes EventBridge, Slack
+  # clicks (via SlackAck async invokes), CLI actions, sweep escalations and
+  # self-reinvokes (§9). Split publish: SNS batch=auto immediately, batch=holds
+  # when the last hold resolves (fix #15). Publishes to SNS — NOT SQS (fix #2/#3).
+  ApproveFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "f5kb-approve-${Stage}"
+      CodeUri:      f5kb/
+      Handler:      f5kb.handlers.approve.handler
+      Role:         !GetAtt LambdaRole.Arn
+      Description:  Gate 1 — auto-approve everything except body-dropped/body-error
+      Timeout:      900
+      MemorySize:   1024
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          SLACK_MAX_HELD_BLOCKS: "5"
+          # SSM parameter NAME — value fetched + cached at cold start (fix #18).
+          SLACK_WEBHOOK_PARAM:   !Sub "/f5kb/${Stage}/slack/webhook-url"
+          HANDOFF_TOPIC_ARN:     !Ref HandoffTopic
+      EventInvokeConfig:
+        DestinationConfig:
+          OnFailure:
+            Type: SNS
+            Destination: !Ref OpsAlertsTopic
+    Metadata:
+      BuildMethod: makefile
+      BuildTarget: build-AppFunction
+
+  ApproveInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ApproveFunction.Arn
+      Action:       lambda:InvokeFunction
+      Principal:    events.amazonaws.com
+      SourceArn:    !GetAtt ApproveRule.Arn
+
+  ApproveRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name:         !Sub "f5kb-approve-trigger-${Stage}"
+      Description:  Triggers Approve Lambda when track phase completes
+      EventBusName: default
+      EventPattern:
+        source: ["aws.s3"]
+        detail-type: ["Object Created"]
+        detail:
+          bucket:
+            name: [!Ref ArticlesBucket]
+          object:
+            key:
+              - suffix: "/track/_done"
+      State: ENABLED
+      Targets:
+        - Id:  ApproveTarget
+          Arn: !GetAtt ApproveFunction.Arn
+
+  # Enrich trigger: EventBridge -> EnrichQueue (NOT the Lambda — the queue is
+  # what buys retry/DLQ, fix #7). Matches ONLY the 4 enrichable types (§5);
+  # non-enrichable dump/_done keys go straight to the terminal-gate check.
+  EnrichRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name:         !Sub "f5kb-enrich-trigger-${Stage}"
+      Description:  Queues enrichment when an enrichable type's dump completes
+      EventBusName: default
+      EventPattern:
+        source: ["aws.s3"]
+        detail-type: ["Object Created"]
+        detail:
+          bucket:
+            name: [!Ref ArticlesBucket]
+          object:
+            key:
+              - suffix: "/dump/Manual/_done"
+              - suffix: "/dump/Release_Note/_done"
+              - suffix: "/dump/Supplemental_Document/_done"
+              - suffix: "/dump/Bug_Tracker/_done"
+      State: ENABLED
+      Targets:
+        - Id:  EnrichQueueTarget
+          Arn: !GetAtt EnrichQueue.Arn
+
+  # Restore — direct invoke only; reserved concurrency 1; REFUSES while ANY
+  # run is open (v2.1 #23 — a restore mid-scrape gets silently undone by the
+  # in-flight run's stale index snapshot). Publishes batch=restore to SNS.
+  RestoreFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "f5kb-restore-${Stage}"
+      CodeUri:      f5kb/
+      Handler:      f5kb.handlers.restore.handler
+      Role:         !GetAtt LambdaRole.Arn
+      Description:  Reverts an article to an archived version; refuses while a run is open
+      Timeout:      300
+      MemorySize:   512
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          HANDOFF_TOPIC_ARN: !Ref HandoffTopic
+    Metadata:
+      BuildMethod: makefile
+      BuildTarget: build-AppFunction
+
+  # SlackAck — signature verification + <=3s ack (fix #8). NO concurrency cap:
+  # must always answer while Approve (concurrency 1) is busy. Verifies
+  # v0:{ts}:{body} HMAC with 5-min replay window, then async-invokes Approve.
+  SlackAckFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "f5kb-slack-ack-${Stage}"
+      CodeUri:      f5kb/
+      Handler:      f5kb.handlers.slack_ack.handler
+      Role:         !GetAtt LambdaRole.Arn
+      Description:  Verifies Slack signing secret, acks <=3s, forwards decision to Approve async
+      Timeout:      10
+      MemorySize:   128
+      Environment:
+        Variables:
+          SLACK_SIGNING_SECRET_PARAM: !Sub "/f5kb/${Stage}/slack/signing-secret"
+          APPROVE_FUNCTION_NAME:      !Sub "f5kb-approve-${Stage}"
+      Events:
+        SlackCallback:
+          Type: HttpApi
+          Properties:
+            ApiId:  !Ref SlackCallbackApi
+            Path:   /slack
+            Method: POST
+    Metadata:
+      BuildMethod: makefile
+      BuildTarget: build-AppFunction
+
+  # Watchdog — hold-aware hung-run detection + stall auto-redrive (hourly):
+  # approve/_done -> silent; no _done + holds -> INFO; no _done + no holds ->
+  # page with stuck phase; status.json ABSENT entirely -> page "run never
+  # started" (v2.1 #25). Stall auto-redrive: open run + stale cursor + empty
+  # work queue + DLQ message for that run -> re-send the dead resume message
+  # (capped at WATCHDOG_MAX_REDRIVES per message, then escalate-only).
+  # Holds digest emails stay once daily (06:00 pass); action alerts any hour.
+  WatchdogFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "f5kb-watchdog-${Stage}"
+      CodeUri:      f5kb/
+      Handler:      f5kb.handlers.watchdog.handler
+      Role:         !GetAtt LambdaRole.Arn
+      Description:  Hold-aware hung/absent-run detection + stall auto-redrive; pages via ops-alerts
+      Timeout:      120
+      MemorySize:   256
+      Environment:
+        Variables:
+          OPS_TOPIC_ARN:         !Ref OpsAlertsTopic
+          APPROVE_FUNCTION_NAME: !Sub "f5kb-approve-${Stage}"   # stale-hold escalation
+          DUMP_QUEUE_URL:        !Ref DumpQueue
+          ENRICH_QUEUE_URL:      !Ref EnrichQueue
+          DUMP_DLQ_URL:          !Ref DumpDLQ
+          ENRICH_DLQ_URL:        !Ref EnrichDLQ
+      Events:
+        WatchdogCron:
+          Type: ScheduleV2
+          Properties:
+            Name:                       !Sub "f5kb-watchdog-${Stage}"
+            ScheduleExpression:         "rate(1 hour)"   # hourly so a stalled type heals within the hour
+            State:                      !Ref ScheduleState   # both schedules track ScheduleState (§28)
+    Metadata:
+      BuildMethod: makefile
+      BuildTarget: build-AppFunction
+
+  # HTTP API (cheaper + simpler than REST) -> SlackAck. The URL becomes the
+  # Slack app's Interactivity Request URL post-deploy (§23). One Slack app per
+  # stage — an app has exactly ONE Request URL (§28).
+  SlackCallbackApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+      Description: !Sub "f5kb ${Stage} — Slack Block Kit button callbacks (SlackAck)"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # LOG GROUPS — explicit resources, 30-day retention, one per function (§19)
+  # ════════════════════════════════════════════════════════════════════════════
+  OrchestratorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/f5kb-orchestrator-${Stage}"
+      RetentionInDays: 30
+  DumpLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/f5kb-dump-${Stage}"
+      RetentionInDays: 30
+  EnrichLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/f5kb-enrich-${Stage}"
+      RetentionInDays: 30
+  TrackLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/f5kb-track-${Stage}"
+      RetentionInDays: 30
+  ApproveLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/f5kb-approve-${Stage}"
+      RetentionInDays: 30
+  RestoreLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/f5kb-restore-${Stage}"
+      RetentionInDays: 30
+  SlackAckLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/f5kb-slack-ack-${Stage}"
+      RetentionInDays: 30
+  WatchdogLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/f5kb-watchdog-${Stage}"
+      RetentionInDays: 30
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # METRIC FILTERS — §16 table (7 logical metrics; NO RunDate dimension,
+  # fix #19). Implementation note: a metric filter binds to exactly ONE log
+  # group, so ErrorCount needs one filter per function log group (8) and
+  # SNSPublished is emitted by both Approve and Restore (2). Same metric
+  # name + dimensions = one aggregated metric in CloudWatch.
+  # ════════════════════════════════════════════════════════════════════════════
+  ArticlesStagedFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref DumpLogGroup
+      FilterPattern: '{ $.action = "article_staged" }'
+      MetricTransformations:
+        - MetricName: ArticlesStaged
+          MetricNamespace: F5KB/Pipeline
+          MetricValue: "1"
+          Unit: Count
+          Dimensions:
+            - Key: TypeKey
+              Value: $.type_key
+
+  ArticlesAutoApprovedFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ApproveLogGroup
+      FilterPattern: '{ $.action = "article_auto_approved" }'
+      MetricTransformations:
+        - MetricName: ArticlesAutoApproved
+          MetricNamespace: F5KB/Pipeline
+          MetricValue: "1"
+          Unit: Count
+
+  ArticlesHeldFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ApproveLogGroup
+      FilterPattern: '{ $.action = "article_held" }'
+      MetricTransformations:
+        - MetricName: ArticlesHeld
+          MetricNamespace: F5KB/Pipeline
+          MetricValue: "1"
+          Unit: Count
+
+  EnrichFailedFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref EnrichLogGroup
+      FilterPattern: '{ ($.action = "article_enrich_failed") && ($.final IS TRUE) }'
+      MetricTransformations:
+        - MetricName: EnrichFailed
+          MetricNamespace: F5KB/Pipeline
+          MetricValue: "1"
+          Unit: Count
+          Dimensions:
+            - Key: TypeKey
+              Value: $.type_key
+
+  SNSPublishedApproveFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ApproveLogGroup
+      FilterPattern: '{ $.action = "sns_published" }'
+      MetricTransformations:
+        - MetricName: SNSPublished
+          MetricNamespace: F5KB/Pipeline
+          MetricValue: "1"
+          Unit: Count
+          Dimensions:
+            - Key: Batch
+              Value: $.batch
+
+  SNSPublishedRestoreFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref RestoreLogGroup
+      FilterPattern: '{ $.action = "sns_published" }'
+      MetricTransformations:
+        - MetricName: SNSPublished
+          MetricNamespace: F5KB/Pipeline
+          MetricValue: "1"
+          Unit: Count
+          Dimensions:
+            - Key: Batch
+              Value: $.batch
+
+  # Metric VALUE extracted from $.duration_ms (§31 #13).
+  SlackAckLatencyFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref SlackAckLogGroup
+      FilterPattern: '{ $.action = "ack_sent" }'
+      MetricTransformations:
+        - MetricName: SlackAckLatencyMs
+          MetricNamespace: F5KB/Pipeline
+          MetricValue: "$.duration_ms"
+          Unit: Milliseconds
+
+  # ErrorCount x8 — every ERROR line is alarmed (§16). Dimension Lambda=$.lambda.
+  ErrorCountOrchestratorFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref OrchestratorLogGroup
+      FilterPattern: '{ $.level = "ERROR" }'
+      MetricTransformations:
+        - MetricName: ErrorCount
+          MetricNamespace: F5KB/Pipeline
+          MetricValue: "1"
+          Unit: Count
+          Dimensions: [{Key: Lambda, Value: $.lambda}]
+  ErrorCountDumpFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref DumpLogGroup
+      FilterPattern: '{ $.level = "ERROR" }'
+      MetricTransformations:
+        - MetricName: ErrorCount
+          MetricNamespace: F5KB/Pipeline
+          MetricValue: "1"
+          Unit: Count
+          Dimensions: [{Key: Lambda, Value: $.lambda}]
+  ErrorCountEnrichFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref EnrichLogGroup
+      FilterPattern: '{ $.level = "ERROR" }'
+      MetricTransformations:
+        - MetricName: ErrorCount
+          MetricNamespace: F5KB/Pipeline
+          MetricValue: "1"
+          Unit: Count
+          Dimensions: [{Key: Lambda, Value: $.lambda}]
+  ErrorCountTrackFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref TrackLogGroup
+      FilterPattern: '{ $.level = "ERROR" }'
+      MetricTransformations:
+        - MetricName: ErrorCount
+          MetricNamespace: F5KB/Pipeline
+          MetricValue: "1"
+          Unit: Count
+          Dimensions: [{Key: Lambda, Value: $.lambda}]
+  ErrorCountApproveFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ApproveLogGroup
+      FilterPattern: '{ $.level = "ERROR" }'
+      MetricTransformations:
+        - MetricName: ErrorCount
+          MetricNamespace: F5KB/Pipeline
+          MetricValue: "1"
+          Unit: Count
+          Dimensions: [{Key: Lambda, Value: $.lambda}]
+  ErrorCountRestoreFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref RestoreLogGroup
+      FilterPattern: '{ $.level = "ERROR" }'
+      MetricTransformations:
+        - MetricName: ErrorCount
+          MetricNamespace: F5KB/Pipeline
+          MetricValue: "1"
+          Unit: Count
+          Dimensions: [{Key: Lambda, Value: $.lambda}]
+  ErrorCountSlackAckFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref SlackAckLogGroup
+      FilterPattern: '{ $.level = "ERROR" }'
+      MetricTransformations:
+        - MetricName: ErrorCount
+          MetricNamespace: F5KB/Pipeline
+          MetricValue: "1"
+          Unit: Count
+          Dimensions: [{Key: Lambda, Value: $.lambda}]
+  ErrorCountWatchdogFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref WatchdogLogGroup
+      FilterPattern: '{ $.level = "ERROR" }'
+      MetricTransformations:
+        - MetricName: ErrorCount
+          MetricNamespace: F5KB/Pipeline
+          MetricValue: "1"
+          Unit: Count
+          Dimensions: [{Key: Lambda, Value: $.lambda}]
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # ALARMS — §18. All actions -> f5kb-ops-alerts.
+  # ════════════════════════════════════════════════════════════════════════════
+  DumpDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "f5kb-dump-dlq-${Stage}"
+      AlarmDescription: A type exhausted 3 SQS retries — that type was not scraped. Inspect DLQ message, re-queue the type (§13).
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DumpDLQ.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsAlertsTopic]
+
+  EnrichDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "f5kb-enrich-dlq-${Stage}"
+      AlarmDescription: An enrichable type failed all retries. Inspect, re-queue (§13).
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt EnrichDLQ.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsAlertsTopic]
+
+  # ErrorCount > 0 over 15 min, summed across all 8 Lambda series via metric
+  # math (an alarm cannot wildcard across dimension values of a custom metric).
+  ErrorCountAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "f5kb-error-count-${Stage}"
+      AlarmDescription: A pipeline Lambda hit an ERROR-level condition — run the errors-24h Log Insights query (§16).
+      Metrics:
+        - Id: m1
+          ReturnData: false
+          MetricStat: {Metric: {Namespace: F5KB/Pipeline, MetricName: ErrorCount, Dimensions: [{Name: Lambda, Value: !Sub "f5kb-orchestrator-${Stage}"}]}, Period: 900, Stat: Sum}
+        - Id: m2
+          ReturnData: false
+          MetricStat: {Metric: {Namespace: F5KB/Pipeline, MetricName: ErrorCount, Dimensions: [{Name: Lambda, Value: !Sub "f5kb-dump-${Stage}"}]}, Period: 900, Stat: Sum}
+        - Id: m3
+          ReturnData: false
+          MetricStat: {Metric: {Namespace: F5KB/Pipeline, MetricName: ErrorCount, Dimensions: [{Name: Lambda, Value: !Sub "f5kb-enrich-${Stage}"}]}, Period: 900, Stat: Sum}
+        - Id: m4
+          ReturnData: false
+          MetricStat: {Metric: {Namespace: F5KB/Pipeline, MetricName: ErrorCount, Dimensions: [{Name: Lambda, Value: !Sub "f5kb-track-${Stage}"}]}, Period: 900, Stat: Sum}
+        - Id: m5
+          ReturnData: false
+          MetricStat: {Metric: {Namespace: F5KB/Pipeline, MetricName: ErrorCount, Dimensions: [{Name: Lambda, Value: !Sub "f5kb-approve-${Stage}"}]}, Period: 900, Stat: Sum}
+        - Id: m6
+          ReturnData: false
+          MetricStat: {Metric: {Namespace: F5KB/Pipeline, MetricName: ErrorCount, Dimensions: [{Name: Lambda, Value: !Sub "f5kb-restore-${Stage}"}]}, Period: 900, Stat: Sum}
+        - Id: m7
+          ReturnData: false
+          MetricStat: {Metric: {Namespace: F5KB/Pipeline, MetricName: ErrorCount, Dimensions: [{Name: Lambda, Value: !Sub "f5kb-slack-ack-${Stage}"}]}, Period: 900, Stat: Sum}
+        - Id: m8
+          ReturnData: false
+          MetricStat: {Metric: {Namespace: F5KB/Pipeline, MetricName: ErrorCount, Dimensions: [{Name: Lambda, Value: !Sub "f5kb-watchdog-${Stage}"}]}, Period: 900, Stat: Sum}
+        - Id: total
+          Expression: "SUM([m1,m2,m3,m4,m5,m6,m7,m8])"
+          Label: ErrorCountTotal
+          ReturnData: true
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsAlertsTopic]
+
+  # Acks drifting toward Slack's 3s limit (cold starts / SSM latency) — catch
+  # it before humans see button errors (§18).
+  SlackAckLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "f5kb-slack-ack-latency-${Stage}"
+      AlarmDescription: SlackAck p99 > 2.5s over 15 min — check SlackAck logs (ack_sent durations).
+      Namespace: F5KB/Pipeline
+      MetricName: SlackAckLatencyMs
+      ExtendedStatistic: p99
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 2500
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsAlertsTopic]
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SAVED LOG INSIGHTS QUERIES — §19/§30F: nobody types these under pressure.
+  # ════════════════════════════════════════════════════════════════════════════
+  QueryErrors24h:
+    Type: AWS::Logs::QueryDefinition
+    Properties:
+      Name: !Sub "f5kb-${Stage}/errors-24h"
+      LogGroupNames:
+        - !Ref OrchestratorLogGroup
+        - !Ref DumpLogGroup
+        - !Ref EnrichLogGroup
+        - !Ref TrackLogGroup
+        - !Ref ApproveLogGroup
+        - !Ref RestoreLogGroup
+        - !Ref SlackAckLogGroup
+        - !Ref WatchdogLogGroup
+      QueryString: |
+        fields @timestamp, lambda, action, err_type, type_key, art_id, msg
+        | filter level = "ERROR"
+        | sort @timestamp desc
+        | limit 100
+
+  QueryRunTimeline:
+    Type: AWS::Logs::QueryDefinition
+    Properties:
+      Name: !Sub "f5kb-${Stage}/run-timeline"
+      LogGroupNames:
+        - !Ref OrchestratorLogGroup
+        - !Ref DumpLogGroup
+        - !Ref EnrichLogGroup
+        - !Ref TrackLogGroup
+        - !Ref ApproveLogGroup
+      QueryString: |
+        # edit run_date before running
+        fields @timestamp, lambda, action, type_key, art_id, msg
+        | filter run_date = "2026-01-01"
+        | sort @timestamp asc
+        | limit 10000
+
+  QueryArticleHistory:
+    Type: AWS::Logs::QueryDefinition
+    Properties:
+      Name: !Sub "f5kb-${Stage}/article-history"
+      LogGroupNames:
+        - !Ref DumpLogGroup
+        - !Ref EnrichLogGroup
+        - !Ref TrackLogGroup
+        - !Ref ApproveLogGroup
+        - !Ref RestoreLogGroup
+      QueryString: |
+        # edit art_id before running
+        fields @timestamp, lambda, action, risk, decision, actor, msg
+        | filter art_id = "K00000"
+        | sort @timestamp asc
+
+  QueryConditionalWriteConflicts:
+    Type: AWS::Logs::QueryDefinition
+    Properties:
+      Name: !Sub "f5kb-${Stage}/conditional-write-conflicts"
+      LogGroupNames:
+        - !Ref DumpLogGroup
+        - !Ref EnrichLogGroup
+        - !Ref TrackLogGroup
+        - !Ref ApproveLogGroup
+      QueryString: |
+        # 412 pairs: who won and who lost each sentinel (expected flow at DEBUG)
+        fields @timestamp, lambda, action, type_key, msg
+        | filter action like /(_won|_lost_412)/
+        | sort @timestamp desc
+        | limit 500
+
+  QueryLatencyByType:
+    Type: AWS::Logs::QueryDefinition
+    Properties:
+      Name: !Sub "f5kb-${Stage}/latency-by-type"
+      LogGroupNames:
+        - !Ref DumpLogGroup
+      QueryString: |
+        fields type_key, duration_ms
+        | filter action = "page_fetched"
+        | stats avg(duration_ms) as avg_ms, max(duration_ms) as max_ms, count(*) as pages by type_key
+        | sort avg_ms desc
+
+  QueryAckLatency:
+    Type: AWS::Logs::QueryDefinition
+    Properties:
+      Name: !Sub "f5kb-${Stage}/ack-latency"
+      LogGroupNames:
+        - !Ref SlackAckLogGroup
+      QueryString: |
+        fields @timestamp, duration_ms, action
+        | filter action = "ack_sent"
+        | sort @timestamp desc
+        | limit 200
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # DASHBOARD — §17 (the "pipeline phase" widget is status.json-derived and
+  # intentionally omitted here; use the observability CLI in §17 for phase).
+  # ════════════════════════════════════════════════════════════════════════════
+  PipelineDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "f5kb-pipeline-${Stage}"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Articles staged by type",
+                "region": "${AWS::Region}", "view": "timeSeries", "stacked": false,
+                "metrics": [
+                  [ { "expression": "SEARCH('{F5KB/Pipeline,TypeKey} MetricName=\"ArticlesStaged\"', 'Sum', 300)", "id": "staged", "label": "" } ]
+                ],
+                "period": 300, "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Auto-approved vs held (24h sums)",
+                "region": "${AWS::Region}", "view": "timeSeries", "stacked": false,
+                "metrics": [
+                  [ "F5KB/Pipeline", "ArticlesAutoApproved", { "stat": "Sum", "label": "auto-approved" } ],
+                  [ "F5KB/Pipeline", "ArticlesHeld", { "stat": "Sum", "label": "held" } ]
+                ],
+                "period": 3600
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "P1 DLQ depths (always 0 — P2 DLQ lives in WTIT's dashboard)",
+                "region": "${AWS::Region}", "view": "timeSeries", "stacked": false,
+                "metrics": [
+                  [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "f5kb-dump-dlq-${Stage}", { "stat": "Maximum", "label": "dump DLQ" } ],
+                  [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "f5kb-enrich-dlq-${Stage}", { "stat": "Maximum", "label": "enrich DLQ" } ]
+                ],
+                "period": 300
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Errors by Lambda",
+                "region": "${AWS::Region}", "view": "timeSeries", "stacked": false,
+                "metrics": [
+                  [ { "expression": "SEARCH('{F5KB/Pipeline,Lambda} MetricName=\"ErrorCount\"', 'Sum', 300)", "id": "errs", "label": "" } ]
+                ],
+                "period": 300
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 12, "width": 8, "height": 6,
+              "properties": {
+                "title": "Enrich failures by type (CDN trouble if non-zero)",
+                "region": "${AWS::Region}", "view": "timeSeries", "stacked": false,
+                "metrics": [
+                  [ { "expression": "SEARCH('{F5KB/Pipeline,TypeKey} MetricName=\"EnrichFailed\"', 'Sum', 3600)", "id": "ef", "label": "" } ]
+                ],
+                "period": 3600
+              }
+            },
+            {
+              "type": "metric", "x": 8, "y": 12, "width": 8, "height": 6,
+              "properties": {
+                "title": "SNS publishes by batch (the P2 heartbeat)",
+                "region": "${AWS::Region}", "view": "timeSeries", "stacked": false,
+                "metrics": [
+                  [ { "expression": "SEARCH('{F5KB/Pipeline,Batch} MetricName=\"SNSPublished\"', 'Sum', 3600)", "id": "sns", "label": "" } ]
+                ],
+                "period": 3600
+              }
+            },
+            {
+              "type": "metric", "x": 16, "y": 12, "width": 8, "height": 6,
+              "properties": {
+                "title": "SlackAck p99 latency (must stay < 3000ms)",
+                "region": "${AWS::Region}", "view": "timeSeries", "stacked": false,
+                "metrics": [
+                  [ "F5KB/Pipeline", "SlackAckLatencyMs", { "stat": "p99", "label": "p99 ms" } ]
+                ],
+                "period": 900,
+                "annotations": { "horizontal": [ { "value": 3000, "label": "Slack 3s limit" } ] }
+              }
+            }
+          ]
+        }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Outputs — §23: OrchestratorFunctionName, SlackCallbackUrl, HandoffTopicArn,
+# BucketName (+ ops conveniences).
+# ──────────────────────────────────────────────────────────────────────────────
+Outputs:
+  BucketName:
+    Description: S3 bucket for all pipeline data
+    Value: !Ref ArticlesBucket
+    Export:
+      Name: !Sub "f5kb-${Stage}-BucketName"
+
+  OrchestratorFunctionName:
+    Description: Invoke for manual runs — payloads in §4 ({"mode":"full"}, {"mode":"incremental"}, {"action":"sweep_only"})
+    Value: !Ref OrchestratorFunction
+
+  SlackCallbackUrl:
+    Description: >
+      Set as the Slack app's Interactivity Request URL post-deploy
+      (Settings -> Interactivity & Shortcuts -> Request URL). One Slack app per stage.
+    Value: !Sub "https://${SlackCallbackApi}.execute-api.${AWS::Region}.amazonaws.com/slack"
+
+  HandoffTopicArn:
+    Description: >
+      F5KBHandoffTopic — consumers subscribe their own SQS queue here with
+      RawMessageDelivery=true (handshake, §11). P1 owns the topic only.
+    Value: !Ref HandoffTopic
+    Export:
+      Name: !Sub "f5kb-${Stage}-HandoffTopicArn"
+
+  OpsAlertsTopicArn:
+    Description: All P1 alerting (watchdog, OnFailure destinations, alarms) lands here.
+    Value: !Ref OpsAlertsTopic
+
+  RestoreFunctionName:
+    Description: Invoke to revert an article to an archived version (refuses while any run is open, §12).
+    Value: !Ref RestoreFunction

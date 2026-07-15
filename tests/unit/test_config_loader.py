@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from f5kb.config.loader import load_config, load_field_descriptions_file
+from f5kb.config.loader import load_config, load_field_descriptions_file, types_for_lambda
 from f5kb.config.types import AppConfig, normalize_type
 
 
@@ -73,12 +73,53 @@ products:
 
 def test_load_real_config():
     """Smoke test against the actual config.yaml."""
-    cfg_path = Path(__file__).parent.parent.parent.parent / "config.yaml"
+    cfg_path = Path(__file__).parent.parent.parent / "config.yaml"
     if not cfg_path.exists():
         pytest.skip("config.yaml not found")
     cfg = load_config(str(cfg_path))
     assert len(cfg.types) > 0
     assert len(cfg.field_descriptions) > 0
+
+
+def test_types_for_lambda_shape(tmp_path):
+    """The lambda/config/types.json payload: {type_key: {documentType,
+    metadata, content}} with the wildcard kept as the string "*"."""
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text("""
+types:
+  Support_Solution:
+    documentType: "Support Solution"
+    metadata:
+      - f5_kb_id
+      - f5_title
+    content:
+      - sfdetails__c
+  Video:
+    documentType: "Video"
+    metadata: "*"
+""")
+    out = types_for_lambda(str(cfg_file))
+    assert out["Support_Solution"] == {
+        "documentType": "Support Solution",
+        "metadata": ["f5_kb_id", "f5_title"],
+        "content": ["sfdetails__c"],
+    }
+    assert out["Video"]["metadata"] == "*"
+    assert out["Video"]["content"] == []
+
+
+def test_types_for_lambda_real_config_covers_run_types():
+    """Every type key the pipeline fans out must exist in config.yaml with the
+    real (space-containing) Coveo documentType — the underscored key never
+    matches Coveo's f5_document_type filter for multi-word types."""
+    cfg_path = Path(__file__).parent.parent.parent / "config.yaml"
+    if not cfg_path.exists():
+        pytest.skip("config.yaml not found")
+    out = types_for_lambda(str(cfg_path))
+    from f5kb.handlers.orchestrator import ALL_TYPES
+    for type_key in ALL_TYPES:
+        assert type_key in out, f"config.yaml missing type {type_key}"
+        assert out[type_key]["documentType"], f"{type_key} missing documentType"
 
 
 def test_load_field_descriptions_bare_map(tmp_path):

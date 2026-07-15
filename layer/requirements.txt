@@ -1,0 +1,20 @@
+anyio==4.13.0
+beautifulsoup4==4.15.0
+boto3==1.43.39
+botocore==1.43.39
+certifi==2026.5.20
+click==8.4.1
+colorama==0.4.6 ; sys_platform == 'win32'
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.18
+jmespath==1.1.0
+lxml==6.1.1
+python-dateutil==2.9.0.post0
+pyyaml==6.0.3
+s3transfer==0.19.0
+six==1.17.0
+soupsieve==2.8.4
+typing-extensions==4.15.0
+urllib3==2.7.0

@@ -8,10 +8,8 @@ output shape will fail here.
 import json
 from pathlib import Path
 
-import pytest
-
 from f5kb.lib.changelog import Changelog
-from f5kb.lib.status import StatusReport, TypeStatus, compute_status
+from f5kb.lib.status import TypeStatus, compute_status
 from f5kb.track.db import TrackSummary, track_dump
 
 DUMP_MINI = str(Path(__file__).parent.parent / "fixtures" / "dump_mini")
@@ -19,7 +17,10 @@ DUMP_MINI = str(Path(__file__).parent.parent / "fixtures" / "dump_mini")
 TRACK_SUMMARY_KEYS = {"run_id", "db", "dump", "types", "scanned", "new", "changed", "unchanged", "removed", "per_type"}
 PER_TYPE_KEYS = {"scanned", "new", "changed"}
 STATUS_REPORT_KEYS = {"dump", "db", "db_present", "per_type", "overall", "error_classes", "notes"}
-STATUS_OVERALL_KEYS = {"totalArticles", "bodied", "health", "lastRun", "newestCapturedAt", "stalenessMs", "changelogPath", "changelogLastRun", "pendingApproval"}
+STATUS_OVERALL_KEYS = {
+    "totalArticles", "bodied", "health", "lastRun", "newestCapturedAt",
+    "stalenessMs", "changelogPath", "changelogLastRun", "pendingApproval",
+}
 TYPE_STATUS_KEYS = {"type_key", "disk_count", "expected", "written", "status", "bodied", "errors"}
 CHANGELOG_ENTRY_KEYS = {"runId", "ts", "op", "documentType", "id", "title", "source"}
 

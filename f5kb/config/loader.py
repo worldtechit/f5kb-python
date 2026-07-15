@@ -38,6 +38,25 @@ def load_config(path: str = "config.yaml") -> AppConfig:
     return AppConfig(types=types, field_descriptions=field_descriptions, products=products)
 
 
+def types_for_lambda(path: str = "config.yaml") -> dict[str, dict]:
+    """Serialise the `types:` block for s3://<bucket>/lambda/config/types.json.
+
+    Shape the Lambdas consume: {type_key: {documentType, metadata, content}}.
+    The Dump Lambda reads per-type entries (field split + the exact Coveo
+    documentType filter value); the Orchestrator's legacy branch derives a
+    type list from the mapping keys when TYPE_KEYS is unset.
+    """
+    cfg = load_config(path)
+    return {
+        key: {
+            "documentType": tc.document_type,
+            "metadata": tc.metadata if tc.metadata == "*" else list(tc.metadata),
+            "content": tc.content if tc.content == "*" else list(tc.content),
+        }
+        for key, tc in cfg.types.items()
+    }
+
+
 def load_field_descriptions_file(path: str) -> dict[str, str]:
     """Optional override file for field descriptions. Returns {} on any error."""
     try:

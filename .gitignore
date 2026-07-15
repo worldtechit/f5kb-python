@@ -7,6 +7,11 @@ __pycache__/
 dist/
 build/
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# AWS SAM build artifacts
+.aws-sam/
 
 # Output / generated data directories (article dumps, exports) — large, regenerable
 outputs/
@@ -14,13 +19,16 @@ dump/
 output/
 last_week/
 
-# Local Claude Code settings + memory/plans (machine-specific, not repo content)
-.claude/settings.local.json
-.claude/*.lock
-.claude/scheduled_tasks.lock
-.claude/memory/
-.claude/plans/
+# Local Claude Code state (machine-specific, not repo content)
+.claude/
 .serena/
+
+# Real deploy/UI configs + filled handoff doc carry account ids / alert emails.
+# Committed placeholders: samconfig.example.toml, ui/config.example.yaml,
+# P2_HANDOFF_PLAYBOOK.example.md — copy each to the real name and fill in.
+samconfig.toml
+ui/config.yaml
+P2_HANDOFF_PLAYBOOK.md
 
 # Embedded tracking DB (lives under outputs/, but ignore anywhere)
 *.db
@@ -30,6 +38,23 @@ last_week/
 # Scratch / temp
 *.tmp
 /tmp/
+scratch/
+
+# Operational scripts (contain account IDs and environment-specific paths)
+staging-predeploy.txt
+staging-smoketest.txt
+staging-watch.txt
+staging-recover-dumpfix.txt
+staging-good-run.txt
+aws-change-request.txt
+aws-cost-estimate.txt
+text.txt
+r.json
+r-*.json
+response.json
 
 # discover side-file (copy its products: block into config.yaml)
 discovered_products.yaml
+f5kb-consumer-read.json
+queue-policy.json
+sqs-attrs.json

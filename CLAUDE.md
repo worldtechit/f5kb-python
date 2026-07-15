@@ -100,6 +100,9 @@ overwrite a live article that already holds good data: an EDIT is staged to
 - **TODO.md** — open work + log of shipped work.
 - **config.yaml** — the machine config the CLI reads (`types:` + `field_descriptions:`
   + `products:`). Hand-edit only; excluded from `ruff format`.
+- **ui/README.md** — the web console (`ui/`): pages, targets, mutation safety.
+  **ui/playbook.md** — the operator playbook rendered inside the console.
+- **P2_HANDOFF_PLAYBOOK.md** — the SNS/S3 integration contract for the P2 team.
 
 ## Conventions & gotchas
 

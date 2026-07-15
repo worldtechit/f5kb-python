@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>f5kb console</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div id="shell">
+    <aside id="sidebar">
+      <div class="logo"><span class="mark">f5</span>kb <span class="sub">console</span></div>
+      <nav class="nav" id="nav"></nav>
+      <div class="foot" id="side-foot"></div>
+    </aside>
+    <div id="main">
+      <div id="topbar">
+        <span class="crumb" id="crumb">…</span>
+        <span id="target-badge" class="badge"><span class="dot-ind"></span><span id="badge-text">connecting…</span></span>
+        <span class="spacer"></span>
+        <input id="global-search" class="inp" placeholder="Jump to article id… ( / )" style="width:220px" />
+        <button id="theme-toggle" class="btn ghost sm" title="Toggle theme">◐</button>
+        <span id="refresh-note"></span>
+      </div>
+      <div id="view"></div>
+    </div>
+  </div>
+  <div id="modal-root"></div>
+  <div id="toast-root"></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

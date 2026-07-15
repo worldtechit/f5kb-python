@@ -1,0 +1,62 @@
+# .samignore — excludes files from SAM's source-context copy.
+# NOTE: for Makefile-built resources the Makefile controls zip contents;
+# this file is still load-bearing for the source-copy stage (e.g. .venv/
+# symlinks caused "Operation not permitted" without this exclusion).
+# Git exclusion is .gitignore — keep the two in sync when adding entries.
+
+# ── virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# ── large local-only data ─────────────────────────────────────────────────────
+outputs/
+scratch/
+
+# ── version control ──────────────────────────────────────────────────────────
+.git/
+.gitignore
+
+# ── tool / editor state ──────────────────────────────────────────────────────
+.claude/
+.serena/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.aws-sam/
+.DS_Store
+
+# ── python build artifacts ───────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# ── test suite ────────────────────────────────────────────────────────────────
+tests/
+run_tests.sh
+TEST_GUIDE.md
+
+# ── not part of any Lambda: web console, ops scripts, docs ───────────────────
+ui/
+scripts/
+*.md
+
+# ── CLI entrypoints (handlers are the Lambda entrypoints) ────────────────────
+f5kb/cmd/
+f5kb/cli.py
+f5kb/__main__.py
+
+# ── local config / deploy settings (not read by Lambda at runtime;
+#    config.yaml reaches the pipeline via `make sync-config`, not the zip) ────
+config.yaml
+samconfig.toml
+samconfig.example.toml
+
+# ── local databases / misc ────────────────────────────────────────────────────
+*.db
+*.db-journal
+*.db-wal
+.samignore

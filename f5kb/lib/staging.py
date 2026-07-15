@@ -118,7 +118,10 @@ def merge_pending(out_dir: str, entries: list[PendingEntry], now_iso: str) -> No
 
 
 def _body_len(a: dict | None) -> int:
-    t = (a or {}).get("content", {}).get("bodyText")
+    content = (a or {}).get("content") or {}
+    t = content.get("body_text")
+    if not isinstance(t, str):
+        t = content.get("bodyText")  # tolerate legacy key
     return len(t) if isinstance(t, str) else 0
 
 
