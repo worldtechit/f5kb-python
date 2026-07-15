@@ -55,3 +55,6 @@ response.json
 
 # discover side-file (copy its products: block into config.yaml)
 discovered_products.yaml
+f5kb-consumer-read.json
+queue-policy.json
+sqs-attrs.json
