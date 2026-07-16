@@ -19,6 +19,8 @@ import sys
 import threading
 import time
 
+import pytest
+
 UI = pathlib.Path(__file__).resolve().parents[2] / "ui"
 if str(UI) not in sys.path:
     sys.path.insert(0, str(UI))
@@ -408,3 +410,80 @@ def test_build_run_detail_uses_prefetched_state():
     assert pt["type_key"] == "Known_Issue"
     assert pt["state"] == "done"
     assert pt["dump_count"] == 5
+
+
+# ── run_changes: per-run drill-down behind the counts ─────────────────────────
+def _jsonl(*rows):
+    return "".join(json.dumps(r) + "\n" for r in rows)
+
+
+def _drilldown_store():
+    D = "2026-07-16"
+    return D, FakeStore(objects={
+        f"runs/{D}/manifest/Manual.jsonl": _jsonl(
+            {"id": "m1", "type_key": "Manual"}, {"id": "m2", "type_key": "Manual"}),
+        f"runs/{D}/track/changes.jsonl": _jsonl(
+            {"id": "k1", "type_key": "Known_Issue", "op": "new", "risk": []},
+            {"id": "k2", "type_key": "Known_Issue", "op": "changed", "risk": ["body-shrank-40%"]},
+            {"id": "k3", "type_key": "Known_Issue", "op": "changed", "risk": ["body-error"]},
+            {"id": "k4", "type_key": "Known_Issue", "op": "unchanged", "risk": []}),
+        f"runs/{D}/approve/changed_ids.jsonl": _jsonl(
+            {"id": "k1", "type_key": "Known_Issue", "op": "new", "changed": ["metadata"]},
+            {"id": "k2", "type_key": "Known_Issue", "op": "changed", "changed": ["metadata", "content"]}),
+    })
+
+
+def test_run_changes_staged_lists_manifest_rows():
+    D, store = _drilldown_store()
+    r = StoreReader(store)
+    res = r.run_changes(D, "staged", type_key="Manual")
+    assert res["total"] == 2
+    assert [row["id"] for row in res["rows"]] == ["m1", "m2"]
+    assert all(row["type_key"] == "Manual" for row in res["rows"])
+
+
+def test_run_changes_staged_requires_type():
+    D, store = _drilldown_store()
+    with pytest.raises(ValueError):
+        StoreReader(store).run_changes(D, "staged")
+
+
+def test_run_changes_track_filters_by_op():
+    D, store = _drilldown_store()
+    res = StoreReader(store).run_changes(D, "track", op="changed")
+    assert res["total"] == 2
+    assert {row["id"] for row in res["rows"]} == {"k2", "k3"}
+
+
+def test_run_changes_track_risk_prefix_matches_shrank_suffix():
+    D, store = _drilldown_store()
+    res = StoreReader(store).run_changes(D, "track", risk="body-shrank")
+    assert [row["id"] for row in res["rows"]] == ["k2"]
+    exact = StoreReader(store).run_changes(D, "track", risk="body-error")
+    assert [row["id"] for row in exact["rows"]] == ["k3"]
+
+
+def test_run_changes_auto_returns_what_changed():
+    D, store = _drilldown_store()
+    res = StoreReader(store).run_changes(D, "auto")
+    assert res["total"] == 2
+    assert res["rows"][1]["changed"] == ["metadata", "content"]
+
+
+def test_run_changes_paginates():
+    D, store = _drilldown_store()
+    res = StoreReader(store).run_changes(D, "track", page=2, size=1)
+    assert res["total"] == 4 and res["pages"] == 4 and res["page"] == 2
+    assert len(res["rows"]) == 1 and res["rows"][0]["id"] == "k2"
+
+
+def test_run_changes_unknown_kind_raises():
+    D, store = _drilldown_store()
+    with pytest.raises(ValueError):
+        StoreReader(store).run_changes(D, "bogus")
+
+
+def test_run_changes_missing_manifest_is_empty():
+    D, store = _drilldown_store()
+    res = StoreReader(store).run_changes("1999-01-01", "auto")
+    assert res["total"] == 0 and res["rows"] == []

@@ -79,8 +79,10 @@ def _check(pattern: re.Pattern[str], value: str, what: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 DOCS: list[dict[str, str]] = [
     {"name": "playbook", "title": "Console Playbook", "group": "Operate", "path": "ui/playbook.md"},
-    {"name": "consumer-guide", "title": "Consumer Guide (SNS/S3 contract)", "group": "Operate", "path": "docs/CONSUMER_GUIDE.md"},
-    {"name": "master-pipeline", "title": "Pipeline Master Reference (P1)", "group": "Operate", "path": "docs/MASTER_PIPELINE_DOC.md"},
+    {"name": "consumer-guide", "title": "Consumer Guide (SNS/S3 contract)",
+     "group": "Operate", "path": "docs/CONSUMER_GUIDE.md"},
+    {"name": "master-pipeline", "title": "Pipeline Master Reference (P1)",
+     "group": "Operate", "path": "docs/MASTER_PIPELINE_DOC.md"},
     {"name": "deployments", "title": "Deployments (AWS stages)", "group": "Operate", "path": "docs/DEPLOYMENTS.md"},
     {"name": "howto", "title": "HOWTO (CLI workflows)", "group": "Toolkit", "path": "docs/HOWTO.md"},
     {"name": "readme", "title": "README (CLI reference)", "group": "Toolkit", "path": "README.md"},
@@ -163,6 +165,23 @@ def make_app(reader: Reader, original_target: str = "",
         if d is None:
             raise HTTPException(404, f"run {date} not found — deleted or never ran")
         return d
+
+    # Drill-down behind a run's counts: which articles were staged / classified /
+    # auto-approved / held this run (the run view otherwise only shows totals).
+    @app.get("/api/runs/{date}/changes")
+    def run_changes(date: str, kind: str, type: str | None = None,
+                    op: str | None = None, risk: str | None = None,
+                    page: int = 1, size: int = Query(default=50, le=500)) -> dict:
+        _check(_ID_RE, date, "run date")
+        if kind not in ("staged", "track", "auto", "holds"):
+            raise HTTPException(400, f"invalid kind: {kind!r}")
+        if type is not None:
+            _check(_TYPE_RE, type, "type key")
+        try:
+            return reader.run_changes(date, kind, type_key=type, op=op, risk=risk,
+                                      page=page, size=size)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
 
     # ── corpus / articles ────────────────────────────────────────────────────
     @app.get("/api/corpus")

@@ -28,6 +28,11 @@ export const api = {
   overview: () => req("/api/overview"),
   runs: (limit = 20) => req(`/api/runs?limit=${limit}`),
   runDetail: (date) => req(`/api/runs/${encodeURIComponent(date)}`),
+  runChanges: (date, params) =>
+    req(`/api/runs/${encodeURIComponent(date)}/changes?` +
+        new URLSearchParams(
+          Object.fromEntries(Object.entries(params || {}).filter(([, v]) => v != null && v !== ""))
+        ).toString()),
   corpus: (refresh = false) => req(`/api/corpus${refresh ? "?refresh=true" : ""}`),
   articles: (type, q, page, size) =>
     req(`/api/articles/${encodeURIComponent(type)}?q=${encodeURIComponent(q || "")}&page=${page || 1}&size=${size || 25}`),

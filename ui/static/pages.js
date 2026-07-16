@@ -246,6 +246,63 @@ export async function runsPage(view, params, ctx) {
   }, 8000);
 }
 
+// Drill-down: open a paginated list of the articles behind one of a run's
+// counts (staged / track class / auto-approved / held). Each row links to the
+// article view. Backed by the per-run JSONL manifests the pipeline already writes.
+function openChangesModal(ctx, date, { kind, type, op, risk, title }) {
+  const cols = [{ k: "id", label: "article id" }, { k: "type", label: "type" }];
+  if (kind !== "staged") cols.push({ k: "op", label: "op" });
+  if (kind === "auto" || kind === "holds") cols.push({ k: "changed", label: "changed" });
+  if (kind === "track") cols.push({ k: "risk", label: "risk" });
+
+  const cell = (c, r) => {
+    if (c.k === "id") return { html: `<span class="mono">${esc(r.id ?? "?")}</span>` };
+    if (c.k === "type") return { text: r.type_key || "—", cls: "dim" };
+    if (c.k === "op") return { text: r.op || "—" };
+    if (c.k === "changed") return { text: (r.changed || []).join(", ") || "—", cls: "dim" };
+    if (c.k === "risk") {
+      return { el: (r.risk || []).length
+        ? el("span", null, (r.risk || []).map((x) => tag(x, "bad"))) : el("span", "dim", "—") };
+    }
+    return { text: "" };
+  };
+
+  const info = el("div", "dim small mb");
+  const tblWrap = el("div");
+  const pgWrap = el("div", "mt");
+  const bodyBox = el("div", null, [info, tblWrap, pgWrap]);
+  const size = 50;
+  let m;
+
+  async function load(page) {
+    tblWrap.innerHTML = "<div class='dim small'>loading…</div>";
+    let res;
+    try { res = await api.runChanges(date, { kind, type, op, risk, page, size }); }
+    catch (e) { tblWrap.innerHTML = ""; tblWrap.append(empty(e.message)); return; }
+    info.textContent = `${fmtNum(res.total)} article(s)` +
+      (res.truncated ? ` — capped at ${fmtNum(res.rows.length ? size * res.pages : 0)} for display` : "") +
+      (res.total ? " · click a row to open the article" : "");
+    tblWrap.innerHTML = "";
+    if (!res.rows.length) {
+      tblWrap.append(empty("No articles recorded for this count in the run manifests."));
+    } else {
+      const rows = res.rows.map((r) => ({ _r: r, cells: cols.map((c) => cell(c, r)) }));
+      tblWrap.append(table(cols.map((c) => c.label), rows, {
+        onRow: (row) => {
+          if (!row._r.id || !row._r.type_key) return;
+          m.close();
+          ctx.navigate(`#/article/${encodeURIComponent(row._r.type_key)}/${encodeURIComponent(row._r.id)}`);
+        },
+      }));
+    }
+    pgWrap.innerHTML = "";
+    if (res.pages > 1) pgWrap.append(pager(res.page, res.pages, load));
+  }
+
+  m = modal({ title: title || "Articles", sub: `run ${date}`, body: bodyBox, wide: true });
+  load(1);
+}
+
 async function renderRunDetail(box, date, ctx) {
   box.append(skeleton(6));
   let d;
@@ -330,7 +387,10 @@ async function renderRunDetail(box, date, ctx) {
     "or held in-flight by SQS; dumping/enriching: a Lambda is actively working; " +
     "(resumed): the Lambda hit its 15-minute limit and continued from its saved " +
     "cursor — completely normal for large types; done: this type is finished for " +
-    "the run."));
+    "the run.\n\n" +
+    "Tip: the staged count (and the track/approve counts below) are clickable — " +
+    "they open the exact list of articles behind the number, each linking to the " +
+    "article."));
   box.append(typeHead);
   const typeTable = table(["type", "", { label: "staged", cls: "num" },
     { label: "enriched", cls: "num" }, { label: "failed", cls: "num" }, "state"], rows);
@@ -342,6 +402,15 @@ async function renderRunDetail(box, date, ctx) {
     const tds = tr.querySelectorAll("td");
     ["", "", `dump-${r._type}`, `enr-${r._type}`, `fail-${r._type}`, `state-${r._type}`]
       .forEach((a, j) => { if (a && tds[j]) tds[j].dataset.anchor = a; });
+    // Make the STAGED cell a drill-down into that type's staged manifest.
+    const pt = (d.per_type || [])[i];
+    const stagedTd = tds[2];
+    if (stagedTd && pt && (pt.dump_count || 0) > 0) {
+      stagedTd.classList.add("drill");
+      stagedTd.dataset.drill = "staged";
+      stagedTd.dataset.drillType = r._type;
+      stagedTd.dataset.drillTitle = `Staged this run — ${r._type}`;
+    }
   });
   box.append(typeTable);
 
@@ -358,17 +427,31 @@ async function renderRunDetail(box, date, ctx) {
     "body, pending has none), body error (the enrichment fetch failed). Only " +
     "dropped and error force a human hold, and only when a live version exists."));
   trackCard.append(trackH);
-  const kv = (k, v, cls, anchor) => {
+  // kv row; pass `drill` to make it a clickable drill-down when its count > 0.
+  const kv = (k, v, cls, anchor, drill) => {
     const row = html("div", "kv",
       `<span>${esc(k)}</span><span class="v ${cls || ""}" ${anchor ? `data-kv="${anchor}"` : ""}>${esc(String(v))}</span>`);
+    if (drill && (drill.count || 0) > 0) {
+      row.classList.add("drill");
+      row.dataset.drill = drill.kind;
+      if (drill.op) row.dataset.drillOp = drill.op;
+      if (drill.risk) row.dataset.drillRisk = drill.risk;
+      row.dataset.drillTitle = drill.title || "Articles";
+    }
     return row;
   };
-  trackCard.append(kv("new", fmtNum(t.new), "", "t-new"));
-  trackCard.append(kv("changed", fmtNum(t.changed), "", "t-changed"));
-  trackCard.append(kv("unchanged", fmtNum(t.unchanged), "", "t-unchanged"));
-  trackCard.append(kv("body shrank", fmtNum(t.body_shrank), "", "t-shrank"));
-  trackCard.append(kv("body dropped", fmtNum(t.body_dropped), t.body_dropped ? "bad" : "", "t-dropped"));
-  trackCard.append(kv("body error", fmtNum(t.body_error), t.body_error ? "bad" : "", "t-error"));
+  trackCard.append(kv("new", fmtNum(t.new), "", "t-new",
+    { kind: "track", op: "new", title: "New articles", count: t.new }));
+  trackCard.append(kv("changed", fmtNum(t.changed), "", "t-changed",
+    { kind: "track", op: "changed", title: "Changed articles", count: t.changed }));
+  trackCard.append(kv("unchanged", fmtNum(t.unchanged), "", "t-unchanged",
+    { kind: "track", op: "unchanged", title: "Unchanged articles", count: t.unchanged }));
+  trackCard.append(kv("body shrank", fmtNum(t.body_shrank), "", "t-shrank",
+    { kind: "track", risk: "body-shrank", title: "Body shrank", count: t.body_shrank }));
+  trackCard.append(kv("body dropped", fmtNum(t.body_dropped), t.body_dropped ? "bad" : "", "t-dropped",
+    { kind: "track", risk: "body-dropped", title: "Body dropped", count: t.body_dropped }));
+  trackCard.append(kv("body error", fmtNum(t.body_error), t.body_error ? "bad" : "", "t-error",
+    { kind: "track", risk: "body-error", title: "Body error", count: t.body_error }));
   grid.append(trackCard);
 
   const apprCard = el("div", "card");
@@ -381,8 +464,10 @@ async function renderRunDetail(box, date, ctx) {
     "track/_done starts approve, approve/_done closes the run. A phase that seems " +
     "stuck usually means its gate file has not appeared yet."));
   apprCard.append(apprH);
-  apprCard.append(kv("auto-approved", fmtNum(d.approve.auto), "good", "a-auto"));
-  apprCard.append(kv("holds-approved", fmtNum(d.approve.holds), d.approve.holds ? "good" : "", "a-holds"));
+  apprCard.append(kv("auto-approved", fmtNum(d.approve.auto), "good", "a-auto",
+    { kind: "auto", title: "Auto-approved → live + P2", count: d.approve.auto }));
+  apprCard.append(kv("holds-approved", fmtNum(d.approve.holds), d.approve.holds ? "good" : "", "a-holds",
+    { kind: "holds", title: "Holds approved", count: d.approve.holds }));
   apprCard.append(kv("scrape/_done", d.markers.scrape_done ? "✓" : "·",
     d.markers.scrape_done ? "good" : "", "m-scrape"));
   apprCard.append(kv("track/_done", d.markers.track_done ? "✓" : "·",
@@ -393,6 +478,20 @@ async function renderRunDetail(box, date, ctx) {
   box.append(grid);
 
   if ((d.held || []).length) box.append(heldSection(d, ctx));
+
+  // One delegated handler for every drill-down cell/row (survives live cell
+  // patching, which only rewrites cell contents, not these container elements).
+  box.onclick = (ev) => {
+    const t = ev.target.closest("[data-drill]");
+    if (!t || !box.contains(t)) return;
+    openChangesModal(ctx, date, {
+      kind: t.dataset.drill,
+      type: t.dataset.drillType || null,
+      op: t.dataset.drillOp || null,
+      risk: t.dataset.drillRisk || null,
+      title: t.dataset.drillTitle || "Articles",
+    });
+  };
 }
 
 // ── run controls: pause / stop / delete ──────────────────────────────────────
