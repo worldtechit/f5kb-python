@@ -1,6 +1,6 @@
 """Run assembly — compose a run's live status from the per-stage S3 files.
 
-Reads exactly the keys the Lambda handlers write (see MEMORIES.md "Cloud (S3)
+Reads exactly the keys the Lambda handlers write (see docs/MEMORIES.md "Cloud (S3)
 data layout" + the handlers themselves):
 
   lambda/state/{date}/orchestrator.json     types + mode for the run

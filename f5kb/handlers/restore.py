@@ -5,7 +5,7 @@ Invoked manually via AWS Lambda console or CLI:
     --function-name f5kb-restore-prod \\
     --payload '{"type_key":"Support_Solution","art_id":"K12345",
                 "archive_key":"archive/Support_Solution/K12345/020000Z.json",
-                "actor":"devinp"}' \\
+                "actor":"operator"}' \\
     response.json
 
 To list available archived versions for an article:

@@ -110,7 +110,7 @@ def _restore_event(**overrides) -> dict:
         "type_key": "Policy",
         "art_id": "K900",
         "archive_key": "archive/Policy/K900/020000Z.json",
-        "actor": "devinp",
+        "actor": "operator",
     }
     event.update(overrides)
     return event

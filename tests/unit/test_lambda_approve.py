@@ -39,7 +39,7 @@ def _track_done_event(run_date: str) -> dict:
     return {"Records": [{"s3": {"object": {"key": f"runs/{run_date}/track/_done"}}}]}
 
 
-def _slack_event(decision: str, run_date: str, type_key: str, art_id: str, actor: str = "devinp") -> dict:
+def _slack_event(decision: str, run_date: str, type_key: str, art_id: str, actor: str = "operator") -> dict:
     # v2.1: Slack callbacks arrive as direct invokes (routed by SlackAck), NOT as
     # API Gateway events. Approve routes on the presence of an "action" field.
     return {
@@ -240,7 +240,7 @@ def test_slack_approve_promotes_and_writes_done(s3):
         # Human-approved holds are written to the run-scoped holds manifest.
         raw = s3.get_bytes(f"runs/{RUN_DATE}/approve/changed_ids-holds.jsonl").decode()
         line = json.loads(raw.strip())
-        assert line["approved_by"] == "devinp"
+        assert line["approved_by"] == "operator"
         assert line["type"] == "Bug_Tracker"
 
 

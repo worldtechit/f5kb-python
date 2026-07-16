@@ -304,6 +304,12 @@ windows and WTIT business hours.
 
 ### Manual invocation
 
+> **Prerequisite: you must be authenticated to the target AWS account first.** Run
+> `aws sts get-caller-identity` and confirm the account matches the stage you mean to
+> touch (account IDs are in 1Password, not the repo — see DEPLOYMENTS.md and the
+> discovery protocol in CLAUDE.md's "Credentials" section). Replace `{stage}` below
+> with `staging` or `prod`.
+
 ```bash
 # Incremental (metadata scan, same as the Mon–Sat schedule)
 aws lambda invoke --function-name f5kb-orchestrator-{stage} --region us-east-2 \
@@ -870,10 +876,10 @@ aws lambda invoke --function-name f5kb-restore-{stage} --region us-east-2 \
   --cli-binary-format raw-in-base64-out \
   --payload '{"type_key":"Policy","art_id":"K12345",
               "archive_key":"archive/Policy/K12345/2026-07-01T02-00-00Z.json",
-              "actor":"devinp"}' r.json && cat r.json
+              "actor":"operator"}' r.json && cat r.json
 # → {"status":"restored","id":"K12345","type_key":"Policy","run_date":"…",
 #    "archive_key":"…","live_key":"live/Policy/K12345.json","displaced_to":"archive/…",
-#    "manifest_key":"runs/…/restore/…/changed_ids.jsonl","actor":"devinp",
+#    "manifest_key":"runs/…/restore/…/changed_ids.jsonl","actor":"operator",
 #    "sns_published":true,"ts":"…"}
 ```
 
@@ -912,17 +918,17 @@ aws s3 cp $B/runs/2026-07-08/approve/changed_ids.jsonl - | jq -s 'group_by(.op) 
 # Approve ALL remaining held articles
 aws lambda invoke --function-name f5kb-approve-{stage} --region us-east-2 \
   --cli-binary-format raw-in-base64-out \
-  --payload '{"action":"approve_all","run_date":"2026-07-08","actor":"devinp"}' r.json
+  --payload '{"action":"approve_all","run_date":"2026-07-08","actor":"operator"}' r.json
 
 # Reject ALL remaining held articles
 aws lambda invoke --function-name f5kb-approve-{stage} --region us-east-2 \
   --cli-binary-format raw-in-base64-out \
-  --payload '{"action":"reject_all","run_date":"2026-07-08","actor":"devinp"}' r.json
+  --payload '{"action":"reject_all","run_date":"2026-07-08","actor":"operator"}' r.json
 
 # Approve / reject ONE article
 aws lambda invoke --function-name f5kb-approve-{stage} --region us-east-2 \
   --cli-binary-format raw-in-base64-out \
-  --payload '{"action":"approve","run_date":"2026-07-08","type_key":"Bug_Tracker","id":"K55123","actor":"devinp"}' r.json
+  --payload '{"action":"approve","run_date":"2026-07-08","type_key":"Bug_Tracker","id":"K55123","actor":"operator"}' r.json
 
 # Re-drive the automatic pass for a run (idempotency guard resumes safely)
 aws lambda invoke --function-name f5kb-approve-{stage} --region us-east-2 \

@@ -86,8 +86,9 @@ resolves via STS unless set in the config.
 - **Integrations** — every f5kb SNS topic for the stage, its subscribers, and
   each subscriber queue's backlog (visible / in-flight / delayed) — a live
   view of downstream ingestion status, plus the last completed handoff run.
-- **Playbook & Docs** — the operator playbook plus all repo docs
-  (README/HOWTO/OUTLINE/FINDINGS/MEMORIES/P2 handoff) rendered in-app.
+- **Playbook & Docs** — the operator playbook plus all repo docs (README plus
+  everything in `docs/`: HOWTO, OUTLINE, FINDINGS, MEMORIES, the pipeline master
+  reference, the consumer guide, deployments, test guide, TODO) rendered in-app.
 
 ## Mutations (require `--allow-writes`)
 

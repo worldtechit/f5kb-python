@@ -68,13 +68,16 @@ def _check(pattern: re.Pattern[str], value: str, what: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 DOCS: list[dict[str, str]] = [
     {"name": "playbook", "title": "Console Playbook", "group": "Operate", "path": "ui/playbook.md"},
-    {"name": "p2-handoff", "title": "P2 Handoff Contract", "group": "Operate", "path": "P2_HANDOFF_PLAYBOOK.md"},
-    {"name": "howto", "title": "HOWTO (CLI workflows)", "group": "Toolkit", "path": "HOWTO.md"},
+    {"name": "consumer-guide", "title": "Consumer Guide (SNS/S3 contract)", "group": "Operate", "path": "docs/CONSUMER_GUIDE.md"},
+    {"name": "master-pipeline", "title": "Pipeline Master Reference (P1)", "group": "Operate", "path": "docs/MASTER_PIPELINE_DOC.md"},
+    {"name": "deployments", "title": "Deployments (AWS stages)", "group": "Operate", "path": "docs/DEPLOYMENTS.md"},
+    {"name": "howto", "title": "HOWTO (CLI workflows)", "group": "Toolkit", "path": "docs/HOWTO.md"},
     {"name": "readme", "title": "README (CLI reference)", "group": "Toolkit", "path": "README.md"},
-    {"name": "outline", "title": "OUTLINE (architecture)", "group": "Toolkit", "path": "OUTLINE.md"},
-    {"name": "findings", "title": "FINDINGS (scraped system)", "group": "Toolkit", "path": "FINDINGS.md"},
-    {"name": "memories", "title": "MEMORIES (project memory)", "group": "Toolkit", "path": "MEMORIES.md"},
-    {"name": "todo", "title": "TODO (open work)", "group": "Toolkit", "path": "TODO.md"},
+    {"name": "outline", "title": "OUTLINE (architecture)", "group": "Toolkit", "path": "docs/OUTLINE.md"},
+    {"name": "findings", "title": "FINDINGS (scraped system)", "group": "Toolkit", "path": "docs/FINDINGS.md"},
+    {"name": "memories", "title": "MEMORIES (project memory)", "group": "Toolkit", "path": "docs/MEMORIES.md"},
+    {"name": "test-guide", "title": "TEST_GUIDE (running tests)", "group": "Toolkit", "path": "docs/TEST_GUIDE.md"},
+    {"name": "todo", "title": "TODO (open work)", "group": "Toolkit", "path": "docs/TODO.md"},
     {"name": "ui-readme", "title": "Console README", "group": "Operate", "path": "ui/README.md"},
 ]
 

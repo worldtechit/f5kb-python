@@ -223,7 +223,7 @@ Migrated from Deno/TypeScript to Python 3.11+ / uv. Full history:
   `github.py` no longer accesses `._client` directly.
 - Test coverage: new unit tests for `dump_types()`, `sync_dump()`, `reconcile()`,
   `Progress` class; live integration tests in `tests/integration/test_live.py`.
-- All 301 offline tests pass. Remote: `worldtechit/f5kb-pythonport`, branch `main`.
+- All 488 offline tests pass. Remote: `worldtechit/f5kb-pythonport`, branch `main`.
 
 
 ## DONE 2026-06-04: INCREMENTAL SYNC + DELETION RECONCILE + CHANGELOG
