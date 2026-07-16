@@ -28,6 +28,30 @@ uv run --group ui python ui/server.py --target prod
 uv run --group ui python ui/server.py --target local
 ```
 
+### AWS credentials (`staging` / `prod`)
+
+boto3 must know **which** credentials to use. If your `aws sso login` uses a named
+profile, tell the server — otherwise it falls back to the default session and you get
+credential errors even though you're "logged in" in the shell:
+
+```bash
+# Select your SSO profile (sets AWS_PROFILE for every client incl. S3)
+uv run --group ui python ui/server.py --target staging --profile my-sso-profile
+
+# Optional guard: refuse to start unless you're logged in to this exact account
+uv run --group ui python ui/server.py --target staging \
+    --profile my-sso-profile --aws-account <account-id> --allow-writes
+```
+
+- `--profile NAME` — the AWS/SSO profile boto3 should use. Equivalent to
+  `export AWS_PROFILE=NAME` before running; skip it if you already exported it or use
+  the default profile.
+- `--aws-account ID` — verifies the resolved caller identity is that account and exits
+  with a clear message if not (guards against pointing at the wrong account).
+- Log in first: `aws sso login --profile NAME` (headless: add `--no-browser`). The
+  server resolves your identity at startup and prints a targeted hint if auth fails —
+  no stack traces. The startup banner shows the active profile + account.
+
 Then open **http://127.0.0.1:8000**. Press `/` anywhere to jump to an article id.
 
 ## Targets

@@ -9,6 +9,16 @@ Run:
     uv run --group ui python ui/server.py --target staging --allow-writes
     uv run --group ui python ui/server.py --target local
 
+AWS auth (staging/prod targets): boto3 needs to know WHICH credentials to use.
+If your `aws sso login` uses a named profile, pass it so every client picks it up:
+    uv run --group ui python ui/server.py --target staging --profile my-sso-profile
+    uv run --group ui python ui/server.py --target staging --profile my-sso-profile \
+        --aws-account 123456789012 --allow-writes
+`--profile` sets AWS_PROFILE for the whole process (SQS/Logs/Lambda/SNS/STS/S3).
+`--aws-account` is an optional guard: the server verifies the logged-in identity is
+that account and refuses to start otherwise. If you already `export AWS_PROFILE=...`
+(or use the default profile), `--profile` is unnecessary.
+
 Then open http://127.0.0.1:8000
 """
 
@@ -16,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import os
 import pathlib
 import re
 import threading
@@ -456,22 +467,93 @@ def make_app(reader: Reader, original_target: str = "",
     return app
 
 
+def _fail_aws_auth(err: Exception, args: argparse.Namespace) -> "None":
+    """Translate a boto3/SSO credential failure into an actionable hint and exit."""
+    prof = args.profile or os.environ.get("AWS_PROFILE") or "<your-profile>"
+    name = type(err).__name__
+    text = str(err)
+    lines = [f"Could not connect to AWS for target '{args.target}': {name}: {text}", ""]
+    if name == "ProfileNotFound":
+        lines += [
+            f"The profile '{args.profile}' is not in your ~/.aws/config.",
+            "  • List profiles:  aws configure list-profiles",
+            "  • Or set one up:  aws configure sso",
+        ]
+    elif name in {"SSOTokenLoadError", "UnauthorizedSSOTokenError",
+                  "TokenRetrievalError", "NoCredentialsError"} \
+            or "sso" in text.lower() or "token" in text.lower() \
+            or "ExpiredToken" in text or "credential" in text.lower():
+        lines += [
+            "You're not logged in (or the SSO token expired) for these credentials.",
+            f"  • Log in:            aws sso login --profile {prof}",
+            "    (headless shells:  aws sso login --profile "
+            f"{prof} --no-browser)",
+            f"  • Then re-run with:  --profile {prof}",
+            "  • Already exported AWS_PROFILE? Confirm with: aws sts get-caller-identity",
+        ]
+    else:
+        lines += [
+            "Check that you're authenticated to the right account:",
+            "  • aws sts get-caller-identity",
+            f"  • pass --profile <name> (you used: {args.profile or 'none / default'})",
+        ]
+    raise SystemExit("\n".join(lines))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="f5kb console")
     ap.add_argument("--target", default="staging", help="config target: local|staging|prod")
     ap.add_argument("--allow-writes", action="store_true",
                     help="enable mutations (trigger/approve/restore/backfill/edit)")
+    ap.add_argument("--profile", default=None,
+                    help="AWS named/SSO profile for boto3 (sets AWS_PROFILE for the "
+                         "whole process). Use when your `aws sso login` targets a "
+                         "named profile. Ignored for --target local.")
+    ap.add_argument("--aws-account", default=None,
+                    help="expected AWS account id; the server verifies the resolved "
+                         "caller identity matches it and refuses to start otherwise.")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
     args = ap.parse_args()
 
-    reader = ReaderRef(load_target(args.target, args.allow_writes))
-    lbl = reader.label()
+    # boto3's default session only finds SSO creds via AWS_PROFILE. Setting it here
+    # (before any client is built) covers every client incl. S3Storage's own.
+    if args.profile:
+        os.environ["AWS_PROFILE"] = args.profile
+
+    try:
+        reader = ReaderRef(load_target(args.target, args.allow_writes))
+        lbl = reader.label()
+        # For AWS targets, resolve the REAL logged-in identity now so (a) auth
+        # failures surface as a clean hint instead of a stack trace on first use,
+        # and (b) the --aws-account guard compares against who you're actually
+        # logged in as — not a value baked into config.yaml.
+        acct = None
+        if lbl.get("mode") == "aws":
+            import boto3
+            acct = boto3.client(
+                "sts", region_name=lbl.get("region")
+            ).get_caller_identity()["Account"]
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001 — turn any boto/SSO error into a hint
+        _fail_aws_auth(e, args)
+
+    if args.aws_account and acct and str(acct) != str(args.aws_account):
+        raise SystemExit(
+            f"account mismatch: --aws-account {args.aws_account} was requested but the "
+            f"active AWS credentials resolve to account {acct}.\n"
+            f"  Log in to the right account/profile "
+            f"(e.g. `aws sso login --profile {args.profile or '<your-profile>'}`) "
+            f"or pass --profile to select it.")
     mode_note = "READ-WRITE" if lbl.get("writable") else "read-only"
     print(f"f5kb console — target={args.target} mode={lbl['mode']} "
           f"layout={lbl.get('layout')} ({mode_note})")
     if lbl.get("bucket"):
         print(f"  bucket: {lbl['bucket']}  region: {lbl.get('region')}")
+    if lbl.get("mode") == "aws":
+        prof = os.environ.get("AWS_PROFILE", "(default credentials)")
+        print(f"  aws profile: {prof}  account: {acct}")
     if lbl.get("root"):
         print(f"  root: {lbl['root']}")
     print(f"  open http://{args.host}:{args.port}")
