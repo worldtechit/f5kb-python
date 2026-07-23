@@ -253,7 +253,7 @@ aws lambda invoke \
   --function-name f5kb-restore-prod \
   --payload '{"type_key":"Solution","art_id":"K12345",
               "archive_key":"archive/Solution/K12345/2026-07-01T02-00-00Z.json",
-              "actor":"devinp"}' \
+              "actor":"operator"}' \
   response.json
 ```
 
@@ -363,7 +363,7 @@ real API.
 
 ## 7. TESTING APPROACH
 
-301 tests, all offline by default (`addopts = "-m 'not live'"`), under `tests/` in
+488 tests, all offline by default (`addopts = "-m 'not live'"`), under `tests/` in
 three categories:
 
 - **unit** — one module's functions in isolation (paging, client, aura/config, dates,

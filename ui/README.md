@@ -28,6 +28,30 @@ uv run --group ui python ui/server.py --target prod
 uv run --group ui python ui/server.py --target local
 ```
 
+### AWS credentials (`staging` / `prod`)
+
+boto3 must know **which** credentials to use. If your `aws sso login` uses a named
+profile, tell the server — otherwise it falls back to the default session and you get
+credential errors even though you're "logged in" in the shell:
+
+```bash
+# Select your SSO profile (sets AWS_PROFILE for every client incl. S3)
+uv run --group ui python ui/server.py --target staging --profile my-sso-profile
+
+# Optional guard: refuse to start unless you're logged in to this exact account
+uv run --group ui python ui/server.py --target staging \
+    --profile my-sso-profile --aws-account <account-id> --allow-writes
+```
+
+- `--profile NAME` — the AWS/SSO profile boto3 should use. Equivalent to
+  `export AWS_PROFILE=NAME` before running; skip it if you already exported it or use
+  the default profile.
+- `--aws-account ID` — verifies the resolved caller identity is that account and exits
+  with a clear message if not (guards against pointing at the wrong account).
+- Log in first: `aws sso login --profile NAME` (headless: add `--no-browser`). The
+  server resolves your identity at startup and prints a targeted hint if auth fails —
+  no stack traces. The startup banner shows the active profile + account.
+
 Then open **http://127.0.0.1:8000**. Press `/` anywhere to jump to an article id.
 
 ## Targets
@@ -59,9 +83,14 @@ resolves via STS unless set in the config.
 - **Runs** — run history; per-type dump/enrich progress with live bars,
   phase stepper (scrape → track → approve → done), alerts ("why is it
   stuck"), track risk breakdown, P2 handoff counts, and the held-article
-  queue with inline diff + approve/reject. With `--allow-writes`: run
-  controls (pause/resume the pipeline, stop a runaway run, delete a run's
-  tracking data with a dry-run preview).
+  queue with inline diff + approve/reject. **Drill-down:** the staged count
+  (per type) and the track/approve counts (new/changed/unchanged, body
+  shrank/dropped/error, auto-approved, holds) are clickable — each opens a
+  paginated list of exactly which articles are behind that number this run,
+  every row linking to the article. Backed by the run's own S3 manifests
+  (`runs/{date}/manifest/*`, `track/changes.jsonl`, `approve/changed_ids*.jsonl`).
+  With `--allow-writes`: run controls (pause/resume the pipeline, stop a
+  runaway run, delete a run's tracking data with a dry-run preview).
 - **Review** — every staged edit in `pending/`, grouped by type, plus the
   held queue of the open run. With `--allow-writes`: checkbox selection with
   per-type select-all and bulk approve/reject on the pending list (console-
@@ -86,8 +115,9 @@ resolves via STS unless set in the config.
 - **Integrations** — every f5kb SNS topic for the stage, its subscribers, and
   each subscriber queue's backlog (visible / in-flight / delayed) — a live
   view of downstream ingestion status, plus the last completed handoff run.
-- **Playbook & Docs** — the operator playbook plus all repo docs
-  (README/HOWTO/OUTLINE/FINDINGS/MEMORIES/P2 handoff) rendered in-app.
+- **Playbook & Docs** — the operator playbook plus all repo docs (README plus
+  everything in `docs/`: HOWTO, OUTLINE, FINDINGS, MEMORIES, the pipeline master
+  reference, the consumer guide, deployments, test guide, TODO) rendered in-app.
 
 ## Mutations (require `--allow-writes`)
 

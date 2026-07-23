@@ -23,7 +23,7 @@ Sections it covers:
 | Section | What | Network |
 |---------|------|---------|
 | §0 | version + help flags | offline |
-| §1 | full pytest suite — 302 offline tests across 25 files (5 live tests skipped unless `RUN_LIVE=1`) | offline |
+| §1 | full pytest suite — 488 offline tests across 37 files (5 live tests skipped unless `RUN_LIVE=1`) | offline |
 | §2 | track — first run, idempotent, `--json`, `--types`, `--exclude-types` | offline |
 | §3 | status — table + JSON output, missing DB | offline |
 | §4 | approve — empty pending dir, `--list`, `--reject`, `--json` | offline |

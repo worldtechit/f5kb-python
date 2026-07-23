@@ -2,7 +2,7 @@
 
 The operator's guide to this console: what you're looking at, the daily loop,
 and exactly what to do when something needs a human. For the CLI toolkit see
-the HOWTO; for the P2 integration contract see the P2 Handoff doc.
+docs/HOWTO.md; for the SNS/S3 integration contract see docs/CONSUMER_GUIDE.md.
 
 ---
 

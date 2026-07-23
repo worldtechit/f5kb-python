@@ -23,7 +23,7 @@ is one Click CLI with 12 subcommands; heavy logic lives in `f5kb/lib/`, thin wra
 - **Python port complete.** Project migrated from Deno/TypeScript to Python 3.11+/uv.
   Code lives at repo root (no `python/` subdirectory anymore). Remote:
   `worldtechit/f5kb-pythonport`, branch `python-port` pushed to `main`.
-- **Test suite: 301 offline tests, 0 failed.** 5 additional `@pytest.mark.live`
+- **Test suite: 488 offline tests, 0 failed.** 5 additional `@pytest.mark.live`
   network tests in `tests/integration/test_live.py`.
 - **Full corpus previously built** under `outputs/dump/` + `outputs/articles.db`:
   ~106,045 articles across 13 document types (all except Community and F5_GitHub,
@@ -48,6 +48,11 @@ is one Click CLI with 12 subcommands; heavy logic lives in `f5kb/lib/`, thin wra
   `HeadlessController.getHeadlessConfiguration` (no auth, no key) and auto-refreshed on
   401/419 (the JWT lives ~24h; a long full dump can outlive it). Full mechanics in
   FINDINGS.md.
+- AWS stage facts (account IDs, stack/bucket names, deploy provenance) live in
+  **DEPLOYMENTS.md**, not here — that's deployment state, not project memory. The
+  committed copy is a BLANK template; the filled version is in 1Password. You must be
+  signed in to the right AWS account before any `aws`/`sam` command (discovery
+  protocol in CLAUDE.md's "Credentials" section).
 - Nothing secret is committed anywhere.
 
 ## The pipeline & the safety model (the important mental model)
@@ -153,7 +158,7 @@ lambda/state/<date>/
 {"op":"restored","id":"K12345","type":"Solution","s3_key":"live/Solution/K12345.json",
  "restored_from":"archive/Solution/K12345/2026-07-01T02-00-00Z.json",
  "displaced_to":"archive/Solution/K12345/2026-07-02T14-30-00Z.json",
- "approved_by":"devinp","ts":"2026-07-02T14:30:00Z"}
+ "approved_by":"operator","ts":"2026-07-02T14:30:00Z"}
 ```
 
 `op` values: `new` | `changed` | `restored`. `rejected` decisions go to `decisions.jsonl` only (no `changed_ids` entry — rejected articles never enter live/).
@@ -209,7 +214,7 @@ aws lambda invoke \
     "type_key":    "Solution",
     "art_id":      "K12345",
     "archive_key": "archive/Solution/K12345/2026-07-01T02-00-00Z.json",
-    "actor":       "devinp"
+    "actor":       "operator"
   }' \
   response.json
 
@@ -224,7 +229,10 @@ change log and let the next scheduled run re-track.
 
 ## Documentation map (where everything lives)
 
-- **README.md** — full CLI reference (every subcommand, flags, examples, output, config).
+`README.md` and `CLAUDE.md` are at the repo root; all deep-dive docs (including this
+one) live in **`docs/`**.
+
+- **README.md** (root) — overview + full CLI reference (every subcommand, flags, examples, output, config) + the doc index.
 - **HOWTO.md** — task-oriented user guide (quick start + common workflows).
 - **OUTLINE.md** — code architecture: module tree, dump→enrich→track→sync flow, the
   DI design, pagination strategy, testing, decisions, war stories.
@@ -233,9 +241,16 @@ change log and let the next scheduled run re-track.
   my.f5.com sitemap gap analysis (incl. the 47 unindexed K-IDs) is in its "Sitemap"
   section.
 - **TODO.md** — open work + a dated log of shipped work.
-- **CLAUDE.md** — orientation + working rules for Claude Code in this repo.
-- **config.yaml** — the machine config the CLI reads (`types:` keep-lists +
+- **MASTER_PIPELINE_DOC.md** — the cloud-red (P1) serverless pipeline master reference.
+- **CONSUMER_GUIDE.md** — SNS/S3 integration contract for downstream consumers.
+- **TEST_GUIDE.md** — running the test suite from a fresh clone.
+- **DEPLOYMENTS.md** — AWS stage facts (account IDs, stack/bucket names, deploy
+  provenance). Committed copy is a BLANK template; filled version in 1Password.
+- **CLAUDE.md** (root) — orientation + working rules for Claude Code in this repo.
+- **config.yaml** (root) — the machine config the CLI reads (`types:` keep-lists +
   `field_descriptions:` + a read-only `products:` snapshot).
+- **ui/README.md** — the web console (`ui/`): pages, targets, mutation safety.
+- **ui/playbook.md** — the operator playbook rendered inside the console.
 
 ## Open work / watch-list (from TODO.md)
 

@@ -87,22 +87,34 @@ overwrite a live article that already holds good data: an EDIT is staged to
 
 ## Where the docs live (don't duplicate; update the right one)
 
-- **README.md** — usage: every subcommand, flags, examples, output layout.
-- **FINDINGS.md** — discoveries about the scraped system (Coveo token flow, API
+**README.md** and **CLAUDE.md** live at the repo root; every other doc lives in
+**`docs/`**. README is the top-level overview + full CLI reference and indexes
+everything below.
+
+- **README.md** (root) — overview + usage: every subcommand, flags, examples, output
+  layout, and the doc index.
+- **docs/FINDINGS.md** — discoveries about the scraped system (Coveo token flow, API
   limits, field meanings, counts). Appendix A is the full field inventory; the
   my.f5.com sitemap notes + gap analysis are in its "Sitemap" section.
-- **OUTLINE.md** — our code: module tree, the dump→enrich→track flow, the
+- **docs/OUTLINE.md** — our code: module tree, the dump→enrich→track flow, the
   network-injection design, strategies, decisions.
-- **HOWTO.md** — task-oriented user guide: quick start + common workflows with
+- **docs/HOWTO.md** — task-oriented user guide: quick start + common workflows with
   copy-paste examples.
-- **MEMORIES.md** — durable project memory & handoff (current state, credentials,
+- **docs/MEMORIES.md** — durable project memory & handoff (current state, credentials,
   gotchas, data layout, open work).
-- **TODO.md** — open work + log of shipped work.
-- **config.yaml** — the machine config the CLI reads (`types:` + `field_descriptions:`
-  + `products:`). Hand-edit only; excluded from `ruff format`.
+- **docs/TODO.md** — open work + log of shipped work.
+- **docs/MASTER_PIPELINE_DOC.md** — the cloud-red (P1) serverless pipeline master
+  reference: what it does, the SNS/S3 handoff, the AWS resource inventory.
+- **docs/CONSUMER_GUIDE.md** — the SNS/S3 integration contract for downstream
+  consumers (reading the live corpus, catching new articles).
+- **docs/TEST_GUIDE.md** — running the test suite from a fresh clone.
+- **docs/DEPLOYMENTS.md** — AWS stage facts (account IDs, stack/bucket names, deploy
+  provenance). The committed copy is a BLANK template; the filled version lives in
+  1Password (see the "Credentials" section below).
+- **config.yaml** (root) — the machine config the CLI reads (`types:` +
+  `field_descriptions:` + `products:`). Hand-edit only; excluded from `ruff format`.
 - **ui/README.md** — the web console (`ui/`): pages, targets, mutation safety.
   **ui/playbook.md** — the operator playbook rendered inside the console.
-- **P2_HANDOFF_PLAYBOOK.md** — the SNS/S3 integration contract for the P2 team.
 
 ## Conventions & gotchas
 
@@ -112,7 +124,7 @@ overwrite a live article that already holds good data: an EDIT is staged to
   embed it in `__NEXT_DATA__` JSON or render server-side. Don't add Playwright.
 - **Beating Coveo's 5,000-offset cap:** `--all` uses **keyset pagination by `@rowid`**
   (the only sortable/unique field; `@date` is 1-second-resolution and misses
-  null/out-of-window docs). See OUTLINE.md §4.
+  null/out-of-window docs). See docs/OUTLINE.md §4.
 - **`dbKey` must equal `load_hash_index`'s key byte-for-byte.** `db_key(document_type, id)`
   in `f5kb/lib/dump.py` builds `"<document_type> <id>"`. A separator mismatch makes
   every lookup miss and silently disables skip-unchanged (every article looks new).
@@ -140,7 +152,7 @@ overwrite a live article that already holds good data: an EDIT is staged to
 ## Testing
 
 ```
-uv run pytest                  # all 301 offline tests (default: -m 'not live')
+uv run pytest                  # all 488 offline tests (default: -m 'not live')
 uv run pytest -m live          # live/network tests (requires my.f5.com access)
 uv run pytest tests/unit/      # unit only
 uv run pytest tests/integration/  # CLI smoke tests
@@ -165,4 +177,24 @@ responses, a 25-article mini dump) are under `tests/fixtures/`.
 Coveo org `f5networksproduction5vkhn00h`; guest token fetched at runtime via
 `HeadlessController.getHeadlessConfiguration` (no auth needed). Optional
 `GITHUB_TOKEN` env raises the GitHub API limit for F5_GitHub enrichment. Full
-token/credential details in FINDINGS.md.
+token/credential details in docs/FINDINGS.md.
+
+**AWS (staging/prod stacks).** Account IDs, regions, and stack/bucket names are
+**not committed** — the repo's `docs/DEPLOYMENTS.md` is a BLANK template and the
+filled version lives in **1Password** (item _"F5KB — AWS Deployments"_). **SSO
+profile names are deliberately NOT recorded anywhere** because every teammate uses a
+different local profile name for the same account. **You must be authenticated to
+AWS before any `aws`/`sam` command** against these accounts:
+1. Try what's already active: `aws sts get-caller-identity`. If the account ID
+   matches the target stage's in 1Password, you're set — no need to ask.
+2. If that fails, look for a local SSO profile whose `sso_account_id` matches the
+   target account: `grep -B3 <account-id> ~/.aws/config`. A unique match names the
+   profile to `export AWS_PROFILE=<name>`.
+3. If there's no match, more than one candidate, or the session needs a fresh login,
+   ASK the user which profile/account to use — never assume a profile name carried
+   over from a prior conversation or a different teammate.
+4. Once authenticated, the fastest path to "what's deployed" is the bundle
+   `scripts/deploy.sh` writes to
+   `s3://f5kb-articles-<account>-<stage>/deployments/<stage>/` (git SHA, CFN params,
+   deployed_by, timestamp) — cross-check live status with
+   `aws cloudformation describe-stacks --stack-name f5kb-<stage> --region <region>`.

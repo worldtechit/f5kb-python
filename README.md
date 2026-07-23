@@ -1,14 +1,39 @@
 # F5 KB Article Index Toolkit — Python Edition
 
-Usage guide for `f5kb`, a single-command CLI that builds and maintains a local,
-full-fidelity index of F5 Knowledge Base articles (metadata + full body text) for
-every document type, with no login.
+`f5kb` is a single-command CLI that builds and maintains a local, full-fidelity index
+of F5 Knowledge Base articles (metadata + full body text) for every document type,
+with **no login**. There is no public REST API for my.f5.com; everything runs over
+the Coveo guest-token search backend (a token is fetched at runtime — no key, no
+login).
 
-Everything is one entry point with subcommands. There is no public REST API for
-my.f5.com; everything runs over the Coveo guest-token search backend (a token is
-fetched at runtime — no key, no login). See `FINDINGS.md` for the technical detail
-behind every limit and workaround mentioned here. For a task-oriented walkthrough
-(quick start + common workflows) see `HOWTO.md`.
+The pipeline is `dump → enrich → track` (with `sync` for incremental refresh and an
+approval gate that protects live data). A serverless AWS mirror of the same pipeline
+(the "cloud-red" P1 stack) is documented in [docs/MASTER_PIPELINE_DOC.md](docs/MASTER_PIPELINE_DOC.md).
+
+This README is the top-level overview and the **full CLI reference**. Everything
+deeper lives in [`docs/`](docs/).
+
+## Documentation
+
+`README.md` (this file) and `CLAUDE.md` live at the repo root; every other doc lives
+in [`docs/`](docs/):
+
+| Doc | What's in it |
+|-----|--------------|
+| [docs/HOWTO.md](docs/HOWTO.md) | Task-oriented guide: quick start + common workflows, copy-paste commands. |
+| [docs/FINDINGS.md](docs/FINDINGS.md) | How the scraped system works: Coveo token flow, API limits, field meanings, counts. Appendix A = full field inventory. |
+| [docs/OUTLINE.md](docs/OUTLINE.md) | Code architecture: module tree, dump→enrich→track flow, the DI design, pagination strategy, decisions. |
+| [docs/MEMORIES.md](docs/MEMORIES.md) | Durable project memory & handoff: current state, gotchas, data layout, open work. |
+| [docs/MASTER_PIPELINE_DOC.md](docs/MASTER_PIPELINE_DOC.md) | The cloud-red (P1) serverless pipeline: SNS/S3 handoff, AWS resource inventory. |
+| [docs/CONSUMER_GUIDE.md](docs/CONSUMER_GUIDE.md) | SNS/S3 integration contract for downstream consumers. |
+| [docs/DEPLOYMENTS.md](docs/DEPLOYMENTS.md) | AWS stage facts (account IDs, buckets, provenance). Committed copy is a **blank template**; the filled version lives in 1Password. |
+| [docs/TEST_GUIDE.md](docs/TEST_GUIDE.md) | Running the test suite from a fresh clone. |
+| [docs/TODO.md](docs/TODO.md) | Open work + a dated log of shipped work. |
+
+> **Working with the AWS stacks?** You must be authenticated to the right AWS account
+> before any `aws`/`sam` command. Account IDs and profile names are **not** in the
+> repo — see the discovery protocol in `CLAUDE.md` ("Credentials") and the (1Password)
+> facts referenced from [docs/DEPLOYMENTS.md](docs/DEPLOYMENTS.md).
 
 ## Requirements
 
@@ -55,7 +80,7 @@ After the first build, you don't rebuild — you REFRESH incrementally with `f5k
 ## Running tests
 
 ```
-uv run pytest                     # all 301 offline tests
+uv run pytest                     # all 488 offline tests
 uv run pytest tests/unit/ -q      # unit tests only
 uv run pytest tests/integration/  # CLI smoke tests
 uv run pytest -m live             # live/network tests (require my.f5.com access)
@@ -141,7 +166,7 @@ _pending/<type>/<id>.json        the staged new version (review vs live)
 _replaced/<type>/<id>.<ts>.json  archived previous version after an approval
 ```
 
-See the `approve` subcommand below, and `HOWTO.md` for the day-to-day workflow.
+See the `approve` subcommand below, and `docs/HOWTO.md` for the day-to-day workflow.
 
 ## Subcommand — dump
 
@@ -648,7 +673,7 @@ uv run f5kb discover --format=json --out=products.json
 It writes a side-file (NOT config.yaml). The file uses the same `products:` schema as
 config.yaml (generatedAt + entries:). To refresh the curated snapshot, copy the
 `products:` block from discovered_products.yaml into config.yaml by hand — discover
-never edits config.yaml. See the config section below and FINDINGS.md "Product
+never edits config.yaml. See the config section below and docs/FINDINGS.md "Product
 discovery" for why the global facet is incomplete, the BIG-IP Documentation TechComm
 source, and the confirmed duplicate product tag pairs.
 
@@ -685,7 +710,7 @@ products: which document types revealed it).
   — those are filled by `f5kb enrich`).
 
 - **`field_descriptions:`** — field-name → short description, used only to annotate the
-  dump catalogue. This is the machine copy of FINDINGS.md Appendix A.
+  dump catalogue. This is the machine copy of docs/FINDINGS.md Appendix A.
 
 - **`products:`** — a READ-ONLY snapshot of discovered products. The pipeline does NOT
   read this section; it is a reference for valid `--product` values. Refresh it via
@@ -698,7 +723,7 @@ type's `_catalogue.md` to see every field with coverage/description/sample, then
 ## Coveo API limits (handled automatically)
 
 The Coveo backend enforces two hard limits; the toolkit works around both. See
-FINDINGS.md for the full technical explanation.
+docs/FINDINGS.md for the full technical explanation.
 
 1. `firstResult + numberOfResults` cannot exceed 5,000. When a result set is larger,
    `dump --all` uses keyset pagination by @rowid (no offset cap, and it captures docs a
@@ -716,24 +741,11 @@ Other notes:
 - The live corpus drifts between runs; counts changing is expected. `dump` validates
   written-vs-server and `track` records the delta.
 - Field availability varies by document type (three source backends: Salesforce
-  Knowledge, non-SF connectors, Zendesk). See FINDINGS.md Appendix A.
+  Knowledge, non-SF connectors, Zendesk). See docs/FINDINGS.md Appendix A.
 
 ## Documentation map
 
-- **README.md** — this file: CLI usage guide (subcommands, flags, examples, outputs,
-  config, API limits).
-- **HOWTO.md** — task-oriented user guide: quick start + common workflows with
-  copy-paste commands.
-- **MEMORIES.md** — durable project memory & handoff: current state, credentials/token
-  flow, gotchas, data layout, and open work.
-- **OUTLINE.md** — our code: module tree, the dump→enrich→track flow, the
-  dependency-injection design, pagination strategy, testing, decisions, and obstacles
-  overcome.
-- **FINDINGS.md** — discoveries about the scraped system (Coveo token flow, API limits,
-  field meanings, counts, deprecation/lifecycle). Appendix A is the full field
-  inventory; the sitemap gap analysis is in its "Sitemap" section.
-- **TODO.md** — open work (the 47-article sitemap gap follow-up) + a log of shipped
-  work.
-- **CLAUDE.md** — orientation for Claude Code working in this repo.
-- **config.yaml** — machine config the CLI reads (`types:` + `field_descriptions:` +
-  `products:`).
+See the [**Documentation**](#documentation) index at the top of this file for every
+doc and what's in it. In short: `README.md` (this file) + `CLAUDE.md` are at the repo
+root; all deep-dive docs live in [`docs/`](docs/); `config.yaml` (root) is the machine
+config the CLI reads (`types:` + `field_descriptions:` + `products:`).

@@ -275,6 +275,69 @@ class Reader:
 
         return self.cache.swr(f"nlines:{key}", 30, load)
 
+    # Per-run change drill-down. Each run already records every article it
+    # touched in a JSONL manifest; the run view only COUNTS those lines. This
+    # reads the rows so a count in the UI can open the list behind it.
+    #   staged → runs/{date}/manifest/{Type}.jsonl        (one file per type)
+    #   track  → runs/{date}/track/changes.jsonl          (op + risk per article)
+    #   auto   → runs/{date}/approve/changed_ids.jsonl    (auto-approved → live/P2)
+    #   holds  → runs/{date}/approve/changed_ids-holds.jsonl
+    _CHANGE_KEYS = {
+        "staged": "runs/{date}/manifest/{type}.jsonl",
+        "track": "runs/{date}/track/changes.jsonl",
+        "auto": "runs/{date}/approve/changed_ids.jsonl",
+        "holds": "runs/{date}/approve/changed_ids-holds.jsonl",
+    }
+    _CHANGE_SCAN_CAP = 100_000  # bound worst-case full-run manifests (memory/latency)
+
+    def run_changes(self, date: str, kind: str, type_key: str | None = None,
+                    op: str | None = None, risk: str | None = None,
+                    page: int = 1, size: int = 50) -> dict[str, Any]:
+        tmpl = self._CHANGE_KEYS.get(kind)
+        if tmpl is None:
+            raise ValueError(f"unknown change kind: {kind!r}")
+        if kind == "staged":
+            if not type_key:
+                raise ValueError("the 'staged' drill-down needs a type_key")
+            key = tmpl.format(date=date, type=type_key)
+        else:
+            key = tmpl.format(date=date)
+
+        raw = parse_jsonl(self.read_text(key))
+        truncated = len(raw) > self._CHANGE_SCAN_CAP
+        if truncated:
+            raw = raw[: self._CHANGE_SCAN_CAP]
+
+        rows: list[dict[str, Any]] = []
+        for r in raw:
+            r_risk = r.get("risk") or []
+            if op and r.get("op") != op:
+                continue
+            # body-shrank is stored with a magnitude suffix (e.g. "body-shrank-42%");
+            # dropped/error match exactly. Prefix match covers both.
+            if risk and not any(x == risk or x.startswith(risk + "-") for x in r_risk):
+                continue
+            rows.append({
+                "id": r.get("id"),
+                "type_key": r.get("type_key") or r.get("type") or type_key,
+                "op": r.get("op"),
+                "changed": r.get("changed") or [],
+                "risk": r_risk,
+                "document_type": r.get("document_type"),
+                "approved_by": r.get("approved_by"),
+            })
+
+        total = len(rows)
+        size = max(1, min(int(size or 50), 500))
+        page = max(1, int(page or 1))
+        pages = max(1, (total + size - 1) // size)
+        start = (page - 1) * size
+        return {
+            "kind": kind, "type_key": type_key, "op": op, "risk": risk,
+            "total": total, "page": page, "size": size, "pages": pages,
+            "truncated": truncated, "rows": rows[start:start + size],
+        }
+
     # ── pipeline views ────────────────────────────────────────────────────────
     def list_run_dates(self, limit: int = 30) -> list[str]:
         keys = self.cache.get("run-dates", 15)

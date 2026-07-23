@@ -23,12 +23,13 @@ last_week/
 .claude/
 .serena/
 
-# Real deploy/UI configs + filled handoff doc carry account ids / alert emails.
-# Committed placeholders: samconfig.example.toml, ui/config.example.yaml,
-# P2_HANDOFF_PLAYBOOK.example.md — copy each to the real name and fill in.
+# Real deploy/UI configs + the filled deployments doc carry account ids / alert
+# emails. Committed placeholders: samconfig.example.toml, ui/config.example.yaml,
+# docs/DEPLOYMENTS.md (blank template) — copy each to the real name and fill in.
+# The filled deployments doc (DEPLOYMENTS.local.md) also lives in 1Password.
 samconfig.toml
 ui/config.yaml
-P2_HANDOFF_PLAYBOOK.md
+DEPLOYMENTS.local.md
 
 # Embedded tracking DB (lives under outputs/, but ignore anywhere)
 *.db

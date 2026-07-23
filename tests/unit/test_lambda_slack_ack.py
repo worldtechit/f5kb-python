@@ -54,7 +54,7 @@ def fake_lambda(monkeypatch):
     return calls
 
 
-def _payload(action_id: str, user: str = "devinp") -> dict:
+def _payload(action_id: str, user: str = "operator") -> dict:
     return {
         "actions": [{"action_id": action_id}],
         "user": {"username": user},
@@ -108,7 +108,7 @@ def test_approve_button_invokes_approve(signed, fake_lambda):
         "run_date": "2026-07-01",
         "type_key": "Manual",
         "id": "K123",
-        "actor": "devinp",
+        "actor": "operator",
         "response_url": "https://hooks.slack.com/actions/T0/response",
     }
 

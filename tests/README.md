@@ -5,7 +5,7 @@ Test suite for f5kb. All tests run offline by default — no network required.
 ## Run
 
 ```
-uv run pytest                  # all 301 offline tests (default)
+uv run pytest                  # all 488 offline tests (default)
 uv run pytest -m live          # live/network tests (requires my.f5.com access)
 uv run pytest tests/unit/      # unit tests only
 uv run pytest tests/integration/  # integration + CLI smoke tests
